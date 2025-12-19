@@ -83,6 +83,46 @@ export function createWriteTools(): any[] {
         },
         required: ["parentNoteId", "title", "type"],
       },
+      outputSchema: {
+        type: "object",
+        description: "Details of the newly created note",
+        properties: {
+          noteId: {
+            type: "string",
+            description: "Unique identifier of the created note"
+          },
+          title: {
+            type: "string",
+            description: "Title of the created note"
+          },
+          type: {
+            type: "string",
+            description: "Type of the note (text, code, etc.)"
+          },
+          mime: {
+            type: "string",
+            description: "MIME type of the note"
+          },
+          dateCreated: {
+            type: "string",
+            description: "Creation timestamp"
+          },
+          parentNoteIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of parent note IDs"
+          },
+          childNoteIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of child note IDs (empty for newly created notes)"
+          },
+          blobId: {
+            type: "string",
+            description: "Content hash for the note (required for future updates)"
+          }
+        }
+      }
     },
     {
       name: "update_note",
@@ -122,6 +162,28 @@ export function createWriteTools(): any[] {
           }
         },
         required: ["noteId", "expectedHash"]
+      },
+      outputSchema: {
+        type: "object",
+        description: "Details of the updated note",
+        properties: {
+          noteId: {
+            type: "string",
+            description: "Unique identifier of the updated note"
+          },
+          title: {
+            type: "string",
+            description: "Updated title of the note"
+          },
+          blobId: {
+            type: "string",
+            description: "New content hash after update (use this for subsequent updates)"
+          },
+          dateModified: {
+            type: "string",
+            description: "Timestamp of the modification"
+          }
+        }
       }
     },
     {
@@ -137,6 +199,20 @@ export function createWriteTools(): any[] {
         },
         required: ["noteId"],
       },
+      outputSchema: {
+        type: "object",
+        description: "Deletion confirmation",
+        properties: {
+          success: {
+            type: "boolean",
+            description: "Whether the deletion was successful"
+          },
+          noteId: {
+            type: "string",
+            description: "ID of the deleted note"
+          }
+        }
+      }
     },
     {
       name: "search_and_replace_note",
@@ -177,6 +253,24 @@ export function createWriteTools(): any[] {
           }
         },
         required: ["noteId", "searchPattern", "replacePattern", "expectedHash"]
+      },
+      outputSchema: {
+        type: "object",
+        description: "Search and replace results",
+        properties: {
+          noteId: {
+            type: "string",
+            description: "ID of the modified note"
+          },
+          matchCount: {
+            type: "number",
+            description: "Number of matches found and replaced"
+          },
+          blobId: {
+            type: "string",
+            description: "New content hash after replacement (use for subsequent updates)"
+          }
+        }
       }
     },
   ];
@@ -225,6 +319,83 @@ export function createReadTools(): any[] {
           },
         },
         required: ["noteId"],
+      },
+      outputSchema: {
+        type: "object",
+        description: "Complete note information with metadata and content",
+        properties: {
+          noteId: {
+            type: "string",
+            description: "Unique identifier of the note"
+          },
+          title: {
+            type: "string",
+            description: "Title of the note"
+          },
+          type: {
+            type: "string",
+            description: "Note type: text, code, render, search, relationMap, book, noteMap, mermaid, webView, file, or image"
+          },
+          mime: {
+            type: "string",
+            description: "MIME type (e.g., text/html, text/javascript, application/pdf)"
+          },
+          content: {
+            type: "string",
+            description: "Note content (HTML for text notes, plain text for code notes, base64 for binary files if includeBinaryContent=true)"
+          },
+          blobId: {
+            type: "string",
+            description: "⚠️ CRITICAL: Content hash required for ALL update operations. Save this value to use in update_note's expectedHash parameter."
+          },
+          isProtected: {
+            type: "boolean",
+            description: "Whether the note is password-protected"
+          },
+          dateCreated: {
+            type: "string",
+            description: "Creation timestamp"
+          },
+          dateModified: {
+            type: "string",
+            description: "Last modification timestamp"
+          },
+          parentNoteIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of parent note IDs (notes that contain this note)"
+          },
+          childNoteIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "⚠️ CRITICAL FOR HIERARCHICAL QUERIES: Array of child note IDs. Each child must be fetched separately using get_note. The parent note does NOT contain child content - you must iterate through this array and fetch each child individually."
+          },
+          parentBranchIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of parent branch IDs (relationships to parents)"
+          },
+          childBranchIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of child branch IDs (relationships to children)"
+          },
+          attributes: {
+            type: "array",
+            description: "Labels and relations attached to this note",
+            items: {
+              type: "object",
+              properties: {
+                attributeId: { type: "string" },
+                type: { type: "string", enum: ["label", "relation"] },
+                name: { type: "string" },
+                value: { type: "string" },
+                position: { type: "number" },
+                isInheritable: { type: "boolean" }
+              }
+            }
+          }
+        }
       }
     },
     {
@@ -257,6 +428,36 @@ export function createReadTools(): any[] {
         },
         required: ["noteName"],
       },
+      outputSchema: {
+        type: "object",
+        description: "Resolved note ID and match information",
+        properties: {
+          noteId: {
+            type: "string",
+            description: "The resolved note ID to use with other tools"
+          },
+          title: {
+            type: "string",
+            description: "Title of the matched note"
+          },
+          score: {
+            type: "number",
+            description: "Match confidence score (higher is better)"
+          },
+          topMatches: {
+            type: "array",
+            description: "Alternative matches when multiple notes found",
+            items: {
+              type: "object",
+              properties: {
+                noteId: { type: "string" },
+                title: { type: "string" },
+                score: { type: "number" }
+              }
+            }
+          }
+        }
+      }
     },
     {
       name: "search_notes",
@@ -265,6 +466,50 @@ export function createReadTools(): any[] {
         type: "object",
         properties: searchProperties,
       },
+      outputSchema: {
+        type: "object",
+        description: "Array of matching notes with metadata",
+        properties: {
+          results: {
+            type: "array",
+            description: "List of notes matching the search criteria",
+            items: {
+              type: "object",
+              properties: {
+                noteId: {
+                  type: "string",
+                  description: "Note ID - use with get_note to retrieve full content"
+                },
+                title: {
+                  type: "string",
+                  description: "Note title"
+                },
+                type: {
+                  type: "string",
+                  description: "Note type"
+                },
+                dateCreated: {
+                  type: "string",
+                  description: "Creation timestamp"
+                },
+                dateModified: {
+                  type: "string",
+                  description: "Last modification timestamp"
+                },
+                parentNoteIds: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Parent note IDs"
+                }
+              }
+            }
+          },
+          totalCount: {
+            type: "number",
+            description: "Total number of matching notes"
+          }
+        }
+      }
     }
   ];
 }
@@ -276,7 +521,7 @@ function createSearchProperties() {
   return {
     text: {
       type: "string",
-      description: "SIMPLE keyword search ONLY - single terms or exact phrases. Examples: 'kubernetes' (finds notes containing 'kubernetes'), 'machine learning' (finds notes containing both 'machine' AND 'learning' together), '\"docker kubernetes\"' (finds notes containing the exact phrase 'docker kubernetes'). ⚠️ WARNING: This parameter does NOT support boolean operators like OR, AND, NOT. If you use 'docker OR kubernetes', it will search for the literal text 'docker OR kubernetes' and return no results. For any boolean logic (OR, AND, NOT), you MUST use searchCriteria parameter instead.",
+      description: "SIMPLE keyword search ONLY - single terms or exact phrases. Examples: 'kubernetes' (finds notes containing 'kubernetes'), 'machine learning' (finds notes containing both 'machine' AND 'learning' together), '\\\"docker kubernetes\\\"' (finds notes containing the exact phrase 'docker kubernetes'). ⚠️ WARNING: This parameter does NOT support boolean operators like OR, AND, NOT. If you use 'docker OR kubernetes', it will search for the literal text 'docker OR kubernetes' and return no results. For any boolean logic (OR, AND, NOT), you MUST use searchCriteria parameter instead.",
     },
     searchCriteria: {
       type: "array",
@@ -337,6 +582,48 @@ export function createReadAttributeTools(): any[] {
           }
         },
         required: ["noteId"]
+      },
+      outputSchema: {
+        type: "object",
+        description: "All attributes attached to the note",
+        properties: {
+          labels: {
+            type: "array",
+            description: "Label attributes (#tags) on this note",
+            items: {
+              type: "object",
+              properties: {
+                attributeId: { type: "string" },
+                name: { type: "string", description: "Label name" },
+                value: { type: "string", description: "Optional label value" },
+                position: { type: "number" },
+                isInheritable: { type: "boolean" }
+              }
+            }
+          },
+          relations: {
+            type: "array",
+            description: "Relation attributes (~connections) on this note",
+            items: {
+              type: "object",
+              properties: {
+                attributeId: { type: "string" },
+                name: { type: "string", description: "Relation name (e.g., 'template', 'author')" },
+                value: { type: "string", description: "Target note ID or title" },
+                position: { type: "number" },
+                isInheritable: { type: "boolean" }
+              }
+            }
+          },
+          summary: {
+            type: "object",
+            description: "Counts of attributes",
+            properties: {
+              totalLabels: { type: "number" },
+              totalRelations: { type: "number" }
+            }
+          }
+        }
       }
     }
   ];
@@ -413,6 +700,25 @@ export function createWriteAttributeTools(): any[] {
                 }
               }
             ]
+          }
+        }
+      },
+      outputSchema: {
+        type: "object",
+        description: "Result of attribute management operation",
+        properties: {
+          operation: {
+            type: "string",
+            description: "Operation that was performed"
+          },
+          success: {
+            type: "boolean",
+            description: "Whether the operation succeeded"
+          },
+          attributeIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "IDs of created/updated/deleted attributes"
           }
         }
       }
