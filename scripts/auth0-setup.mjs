@@ -11,7 +11,9 @@ const [, , audience] = process.argv;
 const domain = process.env.AUTH0_DOMAIN;
 const token = process.env.AUTH0_MGMT_TOKEN;
 if (!audience || !domain || !token) {
-  console.error('usage: AUTH0_DOMAIN=<tenant>.auth0.com AUTH0_MGMT_TOKEN=<token> node scripts/auth0-setup.mjs <audience-url>');
+  console.error(
+    'usage: AUTH0_DOMAIN=<tenant>.auth0.com AUTH0_MGMT_TOKEN=<token> node scripts/auth0-setup.mjs <audience-url>',
+  );
   process.exit(2);
 }
 
@@ -32,7 +34,9 @@ const scopes = [
   { value: 'trilium.admin', description: 'Reserved for destructive operations' },
 ];
 
-const existing = (await api('GET', '/resource-servers?per_page=100')).find((r) => r.identifier === audience);
+const existing = (await api('GET', '/resource-servers?per_page=100')).find(
+  (r) => r.identifier === audience,
+);
 const definition = {
   name: 'Trilium MCP',
   scopes,
@@ -56,5 +60,9 @@ console.log(`MCP_AUTH_MODE=oidc`);
 console.log(`MCP_OIDC_ISSUER=https://${domain}/`);
 console.log(`MCP_PUBLIC_URL=${audience}`);
 console.log(`MCP_OIDC_AUDIENCE=${audience}`);
-console.log('\nRemaining manual steps: enable OIDC Dynamic Application Registration (Settings → Advanced),');
-console.log('promote the database connection to domain level, and assign trilium.* permissions to your user.');
+console.log(
+  '\nRemaining manual steps: enable OIDC Dynamic Application Registration (Settings → Advanced),',
+);
+console.log(
+  'promote the database connection to domain level, and assign trilium.* permissions to your user.',
+);

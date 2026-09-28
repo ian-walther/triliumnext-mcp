@@ -13,13 +13,19 @@ server:
   - tools-call-with-progress
   - json-schema-2020-12
   - http-custom-header-server-validation
-  # server offers no prompts / resources / completions
+  - tools-call-with-logging
+  - tools-call-sampling
+  - tools-call-elicitation
+  - elicitation-sep1034-defaults
+  - elicitation-sep1330-enums
+  # server offers no prompts / resources / completions / logging / subscriptions
   - completion-complete
-  - resources-list
+  - logging-set-level
+  - resources-subscribe
+  - resources-unsubscribe
   - resources-read-text
   - resources-read-binary
   - resources-templates-read
-  - prompts-list
   - prompts-get-simple
   - prompts-get-with-args
   - prompts-get-embedded-resource
@@ -37,6 +43,9 @@ server:
   - input-required-result-capability-check
   # server-stateless: 24/28 pass; the 4 failures are diagnostic-tool checks (not testable)
   - server-stateless
+  # pass with 0 failures but emit a warning, which the alpha CLI reports as unexpected
+  - input-required-result-missing-input-response
+  - input-required-result-ignore-extra-params
   # tasks extension not implemented
   - tasks-lifecycle
   - tasks-capability-negotiation

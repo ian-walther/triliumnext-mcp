@@ -5,13 +5,13 @@ step.
 
 ## Current state (2026-09-27)
 
-| Client | Entry | Server |
-| --- | --- | --- |
-| Claude Desktop | `npx triliumnext-mcp` | upstream 0.3.17 |
-| Codex `[mcp_servers.trilium]` | `npx -y triliumnext-mcp` | upstream 0.3.17 |
-| Codex `[mcp_servers.triliumnext-mcp]` | `node …/triliumnext-mcp/build/index.js` | local 0.3.13 (self-contained copy in `build/`) |
-| Claude Code (project `/Users/ianwalther`) | `node …/triliumnext-mcp/build/index.js` | local 0.3.13 |
-| Claude.ai / Grok / ChatGPT | none | — |
+| Client                                    | Entry                                   | Server                                         |
+| ----------------------------------------- | --------------------------------------- | ---------------------------------------------- |
+| Claude Desktop                            | `npx triliumnext-mcp`                   | upstream 0.3.17                                |
+| Codex `[mcp_servers.trilium]`             | `npx -y triliumnext-mcp`                | upstream 0.3.17                                |
+| Codex `[mcp_servers.triliumnext-mcp]`     | `node …/triliumnext-mcp/build/index.js` | local 0.3.13 (self-contained copy in `build/`) |
+| Claude Code (project `/Users/ianwalther`) | `node …/triliumnext-mcp/build/index.js` | local 0.3.13                                   |
+| Claude.ai / Grok / ChatGPT                | none                                    | —                                              |
 
 ## Step 1: local stdio in parallel
 

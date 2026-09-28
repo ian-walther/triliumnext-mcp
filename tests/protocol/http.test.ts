@@ -140,6 +140,26 @@ describe('HTTP transport (auth none, loopback)', () => {
     expect(res.status).toBe(403);
   });
 
+  it('accepts the public hostname and loopback on a non-loopback bind', async () => {
+    harness = createHarness({
+      MCP_HTTP_HOST: '0.0.0.0',
+      MCP_PUBLIC_URL: 'https://mcp.example.net/trilium/mcp',
+      MCP_AUTH_MODE: 'static',
+      MCP_STATIC_TOKENS: 'x@0123456789abcdef:trilium.read',
+    });
+    const body = {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      },
+      body: '{"jsonrpc":"2.0","id":1,"method":"ping"}',
+    } as const;
+    expect((await harness.fetch('https://mcp.example.net/mcp', body)).status).toBe(401);
+    expect((await harness.fetch('http://127.0.0.1:3939/healthz')).status).toBe(200);
+    expect((await harness.fetch('http://evil.example/mcp', body)).status).toBe(403);
+  });
+
   it('rate limits per client', async () => {
     harness = createHarness({ MCP_RATE_LIMIT_PER_MINUTE: '60', MCP_RATE_LIMIT_BURST: '2' });
     const client = await connect(harness); // consumes budget during the handshake

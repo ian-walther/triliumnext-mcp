@@ -16,18 +16,18 @@ This is a clean-room replacement for the `triliumnext-mcp` prototype. See
 
 ## Tools
 
-| Tool | Scope | What it does |
-| --- | --- | --- |
-| `search_notes` | read | Full-text, structured criteria (labels, relations, properties, hierarchy), or raw Trilium query; paginated summaries |
-| `resolve_note` | read | Title/path/id → note id; reports ambiguity instead of guessing |
-| `get_note` | read | Metadata, attributes, bounded content, `contentHash`, in-content find |
-| `get_note_context` | read | Note + parents + children (optional previews) in one call |
-| `list_children` | read | Direct children in tree order, paginated |
-| `read_attributes` | read | Labels and relations, owned or inherited |
-| `create_note` | write | Markdown/HTML/plain content, attributes, duplicate detection, idempotency key |
-| `patch_note` | write | Hash-protected replace/append/prepend/edit with automatic revision |
-| `update_note_metadata` | write | Title, type, mime |
-| `manage_attributes` | write | Add/update/remove labels and relations with per-operation results |
+| Tool                   | Scope | What it does                                                                                                         |
+| ---------------------- | ----- | -------------------------------------------------------------------------------------------------------------------- |
+| `search_notes`         | read  | Full-text, structured criteria (labels, relations, properties, hierarchy), or raw Trilium query; paginated summaries |
+| `resolve_note`         | read  | Title/path/id → note id; reports ambiguity instead of guessing                                                       |
+| `get_note`             | read  | Metadata, attributes, bounded content, `contentHash`, in-content find                                                |
+| `get_note_context`     | read  | Note + parents + children (optional previews) in one call                                                            |
+| `list_children`        | read  | Direct children in tree order, paginated                                                                             |
+| `read_attributes`      | read  | Labels and relations, owned or inherited                                                                             |
+| `create_note`          | write | Markdown/HTML/plain content, attributes, duplicate detection, idempotency key                                        |
+| `patch_note`           | write | Hash-protected replace/append/prepend/edit with automatic revision                                                   |
+| `update_note_metadata` | write | Title, type, mime                                                                                                    |
+| `manage_attributes`    | write | Add/update/remove labels and relations with per-operation results                                                    |
 
 Deletion, moves, and binary attachments are intentionally absent from this
 release.

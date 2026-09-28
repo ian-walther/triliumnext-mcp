@@ -43,8 +43,42 @@ describe('loadConfig', () => {
         MCP_HTTP_HOST: '0.0.0.0',
         MCP_AUTH_MODE: 'none',
         MCP_DANGEROUSLY_ALLOW_UNAUTHENTICATED: 'true',
+        MCP_ALLOWED_HOSTS: 'mcp.example.net',
       }).auth.mode,
     ).toBe('none');
+  });
+  it('derives the host allow-list', () => {
+    expect(loadConfig(base).http.allowedHosts).toEqual(
+      expect.arrayContaining(['127.0.0.1', 'localhost', '::1']),
+    );
+    expect(() =>
+      loadConfig({
+        ...base,
+        MCP_HTTP_HOST: '0.0.0.0',
+        MCP_AUTH_MODE: 'static',
+        MCP_STATIC_TOKENS: 'x@0123456789abcdef:trilium.read',
+      }),
+    ).toThrow(/MCP_ALLOWED_HOSTS/);
+    const cfg = loadConfig({
+      ...base,
+      MCP_HTTP_HOST: '0.0.0.0',
+      MCP_AUTH_MODE: 'static',
+      MCP_STATIC_TOKENS: 'x@0123456789abcdef:trilium.read',
+      MCP_PUBLIC_URL: 'https://mcp.example.net/trilium/mcp',
+      MCP_ALLOWED_HOSTS: 'alt.example.net',
+    });
+    expect(cfg.http.allowedHosts).toEqual(
+      expect.arrayContaining(['alt.example.net', 'mcp.example.net', '127.0.0.1']),
+    );
+    const any = loadConfig({
+      ...base,
+      MCP_HTTP_HOST: '0.0.0.0',
+      MCP_AUTH_MODE: 'static',
+      MCP_STATIC_TOKENS: 'x@0123456789abcdef:trilium.read',
+      MCP_ALLOW_ANY_HOST: 'true',
+    });
+    expect(any.http.allowAnyHost).toBe(true);
+    expect(any.http.allowedHosts).toEqual([]);
   });
   it('validates oidc settings', () => {
     expect(() => loadConfig({ ...base, MCP_AUTH_MODE: 'oidc' })).toThrow(/MCP_OIDC_ISSUER/);

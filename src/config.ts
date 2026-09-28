@@ -48,7 +48,9 @@ export interface AppConfig {
     port: number;
     path: string;
     publicUrl: string | undefined;
+    /** Hostnames accepted in the Host header (always includes loopback names). Empty when allowAnyHost. */
     allowedHosts: string[];
+    allowAnyHost: boolean;
     allowedOrigins: string[];
     maxBodyBytes: number;
     rateLimit: { perMinute: number; burst: number };
@@ -254,6 +256,19 @@ export function loadConfig(
       `MCP_AUTH_MODE=none is only allowed when MCP_HTTP_HOST is a loopback address (got "${host}"). Set MCP_AUTH_MODE=oidc or static, or MCP_DANGEROUSLY_ALLOW_UNAUTHENTICATED=true behind an authenticating proxy.`,
     );
   }
+  // Host-header allow-list: configured names, the public URL's hostname, and the
+  // loopback names (so container health checks work). Off loopback, something
+  // beyond loopback must be allowed or nothing behind a proxy would get through.
+  const allowAnyHost = envBool(env, 'MCP_ALLOW_ANY_HOST', false);
+  const allowedHosts = new Set<string>(envList(env, 'MCP_ALLOWED_HOSTS'));
+  if (publicUrlRaw) allowedHosts.add(new URL(publicUrlRaw).hostname);
+  if (!isLoopbackHost(host) && allowedHosts.size === 0 && !allowAnyHost) {
+    throw new ConfigError(
+      `MCP_HTTP_HOST=${host} is not loopback: set MCP_ALLOWED_HOSTS (or MCP_PUBLIC_URL) to the hostname(s) clients use, or MCP_ALLOW_ANY_HOST=true to disable Host validation.`,
+    );
+  }
+  for (const name of LOOPBACK_HOSTS) allowedHosts.add(name);
+
   const staticTokensRaw = envString(env, 'MCP_STATIC_TOKENS');
   const staticTokens = staticTokensRaw ? parseStaticTokens(staticTokensRaw) : [];
   if (authMode === 'static' && staticTokens.length === 0) {
@@ -330,7 +345,8 @@ export function loadConfig(
       port: envInt(env, 'MCP_HTTP_PORT', 3939, 0),
       path,
       publicUrl: publicUrlRaw,
-      allowedHosts: envList(env, 'MCP_ALLOWED_HOSTS'),
+      allowedHosts: allowAnyHost ? [] : [...allowedHosts],
+      allowAnyHost,
       allowedOrigins: envList(env, 'MCP_ALLOWED_ORIGINS'),
       maxBodyBytes: envInt(env, 'MCP_MAX_BODY_BYTES', 4 * 1024 * 1024, 1024),
       rateLimit: {

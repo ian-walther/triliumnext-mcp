@@ -1,7 +1,7 @@
 # Auth0 as the authorization server
 
 Auth0 is a hosted service; you create a tenant at https://auth0.com (free tier is
-ample for one person). This server is only the *resource server*: it verifies
+ample for one person). This server is only the _resource server_: it verifies
 tokens Auth0 issues and never mints any.
 
 ## Tenant checklist

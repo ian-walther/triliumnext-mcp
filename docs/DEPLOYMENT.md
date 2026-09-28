@@ -37,7 +37,7 @@ LOG_FORMAT=json
 MCP_AUDIT_LOG_PATH=/var/log/trilium-mcp/audit.jsonl
 ```
 
-Create a *separate* ETAPI token in Trilium for this service so it can be
+Create a _separate_ ETAPI token in Trilium for this service so it can be
 revoked independently of the local stdio token.
 
 ## 3. Compose
@@ -50,7 +50,7 @@ services:
     env_file: /etc/trilium-mcp/env
     volumes:
       - /var/log/trilium-mcp:/var/log/trilium-mcp
-    networks: [proxy, trilium]      # reach Trilium privately; expose only to the proxy
+    networks: [proxy, trilium] # reach Trilium privately; expose only to the proxy
     # no `ports:` — the reverse proxy talks to it on the compose network
 ```
 

@@ -17,7 +17,7 @@ import {
 } from '@modelcontextprotocol/server';
 import type { Context, Hono } from 'hono';
 import type { AppContext } from '../app.js';
-import { SCOPES, isLoopbackHost, type Scope } from '../config.js';
+import { SCOPES, type Scope } from '../config.js';
 import { buildServer } from '../mcp/server.js';
 import { createVerifier } from '../auth/verifier.js';
 import { createRateLimiter } from './rateLimit.js';
@@ -61,11 +61,13 @@ export function createHttpTransport(
     { legacy: http.legacy },
   );
 
-  const bindsLoopback = isLoopbackHost(http.host);
+  // Host validation: the SDK app validates automatically on loopback binds; off
+  // loopback it validates only when an allow-list is given. `allowAnyHost` passes
+  // no list on a non-loopback bind, which disables the check.
   const app = createMcpHonoApp({
     host: http.host,
     maxRequestBodySize: http.maxBodyBytes,
-    ...(http.allowedHosts.length || !bindsLoopback ? { allowedHosts: http.allowedHosts } : {}),
+    ...(http.allowAnyHost ? {} : { allowedHosts: http.allowedHosts }),
     ...(http.allowedOrigins.length ? { allowedOrigins: http.allowedOrigins } : {}),
   });
 
