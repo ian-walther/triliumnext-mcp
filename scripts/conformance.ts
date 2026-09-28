@@ -66,18 +66,52 @@ async function main(): Promise<number> {
         '--requirements',
         revision,
       ];
-      const baseline = `conformance-baseline.yml`;
-      const result = spawnSync('npx', [...args, '--expected-failures', baseline], {
-        stdio: 'inherit',
-        env: process.env,
-      });
-      if (result.status !== 0) failed += 1;
+      const result = spawnSync(
+        'npx',
+        [...args, '--expected-failures', 'conformance-baseline.yml'],
+        {
+          encoding: 'utf8',
+          env: process.env,
+        },
+      );
+      process.stdout.write(result.stdout);
+      process.stderr.write(result.stderr);
+      const complaintsTolerated = onlyWarningOnlyComplaints(`${result.stdout}\n${result.stderr}`);
+      if (result.status !== 0 && !complaintsTolerated) failed += 1;
+      if (result.status !== 0 && complaintsTolerated)
+        console.log('(non-zero exit tolerated: only warning-only scenarios were reported)');
     }
     return failed;
   } finally {
     server.kill('SIGTERM');
     await fake.close();
   }
+}
+
+/**
+ * Scenarios that emit no failing checks but a warning. The alpha CLI reports
+ * them as "unexpected failures" on one revision and as "stale baseline
+ * entries" on the other, so neither baseline state satisfies both runs.
+ */
+const WARNING_ONLY = new Set([
+  'server-sse-multiple-streams',
+  'input-required-result-missing-input-response',
+  'input-required-result-ignore-extra-params',
+]);
+
+/** True when every complaint in the summary concerns a warning-only scenario with zero failed checks. */
+function onlyWarningOnlyComplaints(output: string): boolean {
+  const complaints = [...output.matchAll(/^\s+[✗✓]\s+(\S+)\s*$/gmu)].map((m) => m[1]!);
+  const summary = new Map(
+    [...output.matchAll(/^[✗✓]\s+(\S+):\s+(\d+) passed,\s+(\d+) failed/gmu)].map((m) => [
+      m[1]!,
+      Number(m[3]),
+    ]),
+  );
+  return (
+    complaints.length > 0 &&
+    complaints.every((name) => WARNING_ONLY.has(name) && (summary.get(name) ?? 0) === 0)
+  );
 }
 
 async function waitFor(healthUrl: string): Promise<void> {
