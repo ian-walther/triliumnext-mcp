@@ -15,7 +15,12 @@ import {
   type ContentFormat,
 } from './content.js';
 import { DomainError } from './errors.js';
-import { fingerprintOf, IdempotencyKeyMismatch, type IdempotencyStore } from './idempotency.js';
+import {
+  fingerprintOf,
+  IdempotencyKeyMismatch,
+  type Checkpoint,
+  type IdempotencyStore,
+} from './idempotency.js';
 import { KeyedMutex } from './keyedMutex.js';
 import {
   compilePattern,
@@ -45,7 +50,7 @@ export interface ServiceLimits {
 export interface ServiceDeps {
   client: TriliumClient;
   limits: ServiceLimits;
-  idempotency: IdempotencyStore;
+  idempotency: IdempotencyStore<CreateNoteResult>;
   /** Serializes mutations per note / per create key within this process. */
   mutex?: KeyedMutex;
   /** Wall-clock budget for one caller-supplied regex scan. */
@@ -516,6 +521,8 @@ export interface CreateNoteResult {
   attributeResults: AttributeOpResult[];
   warnings: string[];
   idempotentReplay: boolean;
+  /** True when this is a replay of a request that failed after creating the note. */
+  incomplete?: boolean;
 }
 
 export interface TextEdit {
@@ -736,16 +743,16 @@ export class NotesService {
       position: input.position ?? 'last',
       ifTitleExists: input.ifTitleExists ?? 'error',
     });
-    let firstResult: CreateNoteResult | undefined;
     let outcome;
     try {
       outcome = await idempotency.execute(
         input.principal,
         input.idempotencyKey,
         fingerprint,
-        async (record) => {
-          firstResult = await this.createSerialized(request, record);
-          return { noteId: firstResult.note.noteId, contentHash: firstResult.note.contentHash };
+        (checkpoint) => this.createSerialized(request, checkpoint),
+        (err) => {
+          const d = DomainError.from(err);
+          return { code: d.code, message: d.message };
         },
       );
     } catch (err) {
@@ -753,16 +760,24 @@ export class NotesService {
         throw DomainError.validation(err.message, { idempotencyKey: input.idempotencyKey });
       throw err;
     }
-    if (!outcome.replayed && firstResult) return firstResult;
+    const { record, replayed } = outcome;
+    if (!replayed && record.outcome) return record.outcome;
+    if (record.outcome) {
+      // The original call finished; hand back its outcome, partial failures included.
+      return { ...record.outcome, created: false, idempotentReplay: true };
+    }
+    // The original call failed after the note existed. Never create another;
+    // return what is known and say the request did not complete.
+    const checkpoint = record.checkpoint!;
     let note: EtapiNote;
     try {
-      note = await client.getNote(outcome.record.noteId);
+      note = await client.getNote(checkpoint.noteId);
     } catch (err) {
       if (err instanceof EtapiError && err.isNotFound) {
         throw new DomainError(
           'NOT_FOUND',
           `The note created earlier under idempotencyKey '${input.idempotencyKey}' no longer exists; use a new key to create another`,
-          { noteId: outcome.record.noteId },
+          { noteId: checkpoint.noteId },
         );
       }
       throw DomainError.from(err, 'idempotent replay');
@@ -771,24 +786,28 @@ export class NotesService {
       note: toNoteDetail(note),
       branchId: note.parentBranchIds[0] ?? '',
       created: false,
-      attributeResults: [],
-      warnings: [],
+      attributeResults: checkpoint.partial.attributeResults ?? [],
+      warnings: [
+        ...(checkpoint.partial.warnings ?? []),
+        `The original request failed after the note was created (${record.failure?.code ?? 'UNKNOWN'}): ${record.failure?.message ?? ''}. Attribute results listed are those that completed.`,
+      ],
       idempotentReplay: true,
+      incomplete: true,
     };
   }
 
   /** Creates with the duplicate-title check serialized per (parent, title) within this process. */
   private createSerialized(
     input: CreateNoteInput & { parentNoteId: string; type: string; title: string },
-    record?: (partial: { noteId: string; contentHash: string }) => void,
+    checkpoint?: (c: Checkpoint<CreateNoteResult>) => void,
   ): Promise<CreateNoteResult> {
     const key = `create:${input.parentNoteId}\u0000${input.title}`;
-    return this.mutex.run(key, () => this.createUnlocked(input, record));
+    return this.mutex.run(key, () => this.createUnlocked(input, checkpoint));
   }
 
   private async createUnlocked(
     input: CreateNoteInput & { parentNoteId: string; type: string; title: string },
-    record?: (partial: { noteId: string; contentHash: string }) => void,
+    checkpoint?: (c: Checkpoint<CreateNoteResult>) => void,
   ): Promise<CreateNoteResult> {
     const { client, limits } = this.deps;
     const { parentNoteId, type, title } = input;
@@ -811,7 +830,11 @@ export class NotesService {
       if (existing.length > 0) {
         if (ifTitleExists === 'return_existing') {
           const first = existing[0]!;
-          record?.({ noteId: first.noteId, contentHash: first.blobId });
+          checkpoint?.({
+            noteId: first.noteId,
+            contentHash: first.blobId,
+            partial: { attributeResults: [], warnings },
+          });
           return {
             note: toNoteDetail(first),
             branchId: first.parentBranchIds[0] ?? '',
@@ -863,12 +886,19 @@ export class NotesService {
     } catch (err) {
       throw DomainError.from(err, 'create note');
     }
-    // The note exists from here on; make sure a retry finds it even if the rest fails.
-    record?.({ noteId: createdNote.noteId, contentHash: createdNote.blobId });
-
+    // The note exists from here on; make sure a retry finds it even if the rest fails,
+    // and keep the checkpoint current so a replay can report what completed.
     const attributeResults: AttributeOpResult[] = [];
+    const mark = () =>
+      checkpoint?.({
+        noteId: createdNote.noteId,
+        contentHash: createdNote.blobId,
+        partial: { attributeResults: [...attributeResults], warnings: [...warnings] },
+      });
+    mark();
     for (const def of attributeDefs) {
       attributeResults.push(await this.addAttribute(createdNote.noteId, def));
+      mark();
     }
     const finalNote = attributeDefs.length
       ? await fetchNote(client, createdNote.noteId)
@@ -960,7 +990,13 @@ export class NotesService {
           throw DomainError.validation("operation 'edit' requires a non-empty edits array");
         next = existing;
         for (const [i, edit] of input.edits.entries()) {
-          next = await applyEdit(next, edit, `edits[${i}]`, this.deps.regexTimeoutMs);
+          next = await applyEdit(
+            next,
+            edit,
+            `edits[${i}]`,
+            this.deps.regexTimeoutMs,
+            limits.maxWriteContentBytes,
+          );
           editsApplied += 1;
         }
         break;
@@ -1213,6 +1249,7 @@ export async function applyEdit(
   edit: TextEdit,
   where: string,
   timeoutMs?: number,
+  maxBytes: number = Number.POSITIVE_INFINITY,
 ): Promise<string> {
   if (edit.find === '') throw DomainError.validation(`${where}: find must not be empty`);
   const literal = !edit.regex;
@@ -1236,35 +1273,63 @@ export async function applyEdit(
     throw DomainError.validation(`${where}: '${edit.find}' was not found in the note content`);
   const replacement = (m: RegexMatch): string =>
     expandReplacement(edit.replace, m, content, literal);
-  if (edit.all) {
-    let out = '';
-    let last = 0;
-    for (const m of matches) {
-      out += content.slice(last, m.index) + replacement(m);
-      last = m.index + m.length;
-    }
-    return out + content.slice(last);
-  }
-  const occurrence = edit.occurrence ?? 1;
-  if (!Number.isInteger(occurrence) || occurrence < 1)
-    throw DomainError.validation(`${where}: occurrence must be a positive integer`);
-  if (matches.length > 1 && edit.occurrence === undefined) {
+
+  // Assemble under a byte budget: stop as soon as the output would exceed it,
+  // instead of building a huge string only to measure and reject it.
+  const out = new BoundedBuilder(maxBytes, () => {
     throw new DomainError(
-      'AMBIGUOUS',
-      `${where}: '${edit.find}' occurs ${matches.length} times; set occurrence (1-based) or all=true`,
-      { occurrences: matches.length },
+      'TOO_LARGE',
+      `${where}: the edited content would exceed the limit of ${maxBytes} bytes`,
+      { maxBytes },
     );
+  });
+  let chosen: RegexMatch[];
+  if (edit.all) chosen = matches;
+  else {
+    const occurrence = edit.occurrence ?? 1;
+    if (!Number.isInteger(occurrence) || occurrence < 1)
+      throw DomainError.validation(`${where}: occurrence must be a positive integer`);
+    if (matches.length > 1 && edit.occurrence === undefined) {
+      throw new DomainError(
+        'AMBIGUOUS',
+        `${where}: '${edit.find}' occurs ${matches.length} times; set occurrence (1-based) or all=true`,
+        { occurrences: matches.length },
+      );
+    }
+    const target = matches[occurrence - 1];
+    if (!target)
+      throw DomainError.validation(
+        `${where}: occurrence ${occurrence} exceeds the ${matches.length} matches`,
+      );
+    chosen = [target];
   }
-  const target = matches[occurrence - 1];
-  if (!target)
-    throw DomainError.validation(
-      `${where}: occurrence ${occurrence} exceeds the ${matches.length} matches`,
-    );
-  return (
-    content.slice(0, target.index) +
-    replacement(target) +
-    content.slice(target.index + target.length)
-  );
+  let last = 0;
+  for (const m of chosen) {
+    out.push(content.slice(last, m.index));
+    out.push(replacement(m));
+    last = m.index + m.length;
+  }
+  out.push(content.slice(last));
+  return out.toString();
+}
+
+/** String builder that fails fast once the accumulated UTF-8 size passes a limit. */
+class BoundedBuilder {
+  private readonly parts: string[] = [];
+  private bytes = 0;
+  constructor(
+    private readonly maxBytes: number,
+    private readonly onOverflow: () => never,
+  ) {}
+  push(piece: string): void {
+    if (piece === '') return;
+    this.bytes += Buffer.byteLength(piece, 'utf8');
+    if (this.bytes > this.maxBytes) this.onOverflow();
+    this.parts.push(piece);
+  }
+  toString(): string {
+    return this.parts.join('');
+  }
 }
 
 export async function findInContent(

@@ -88,7 +88,8 @@ export class FakeTrilium {
   readonly revisions: Array<{ noteId: string; description: string; content: string }> = [];
   readonly calls: RecordedCall[] = [];
   /** Inject failures: return a response for a matching call, or undefined to proceed. */
-  intercept: ((call: RecordedCall) => Response | undefined) | undefined;
+  intercept:
+    ((call: RecordedCall) => Response | undefined | Promise<Response | undefined>) | undefined;
   private readonly token: string;
   private readonly noAuth: boolean;
   private readonly now: () => Date;
@@ -404,7 +405,7 @@ export class FakeTrilium {
       ...(body !== undefined ? { body } : {}),
     };
     this.calls.push(call);
-    const intercepted = this.intercept?.(call);
+    const intercepted = await this.intercept?.(call);
     if (intercepted) return intercepted;
     if (!this.noAuth && request.headers.get('authorization') !== this.token) {
       return err(401, 'NOT_AUTHENTICATED', 'Not authenticated');

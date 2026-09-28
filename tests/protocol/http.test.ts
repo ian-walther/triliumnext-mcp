@@ -101,9 +101,11 @@ describe('HTTP transport (auth none, loopback)', () => {
       expect(harness.audit.map((a) => [a.tool, a.ok, a.principal, a.transport])).toEqual([
         ['get_note', true, 'anonymous', 'http'],
         ['get_note', false, 'anonymous', 'http'],
+        ['get_note', false, 'anonymous', 'http'], // schema-rejected noteId, audited as INVALID_ARGUMENTS
         ['patch_note', true, 'anonymous', 'http'],
         ['patch_note', false, 'anonymous', 'http'],
       ]);
+      expect(harness.audit[2]?.code).toBe('INVALID_ARGUMENTS');
       expect(harness.audit[0]?.noteIds).toEqual(['plumb']);
       expect(harness.audit[0]?.era).toBe(modern ? 'modern' : 'legacy');
     });

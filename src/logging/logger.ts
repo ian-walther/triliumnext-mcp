@@ -99,6 +99,8 @@ export interface AuditEvent {
   durationMs: number;
   era?: 'legacy' | 'modern';
   requestId?: string;
+  /** Safe, payload-free facts about the outcome (e.g. which argument names failed validation). */
+  details?: Record<string, unknown>;
 }
 
 export interface AuditLog {

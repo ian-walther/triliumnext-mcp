@@ -12,18 +12,29 @@
  */
 import { createHash } from 'node:crypto';
 
-export interface IdempotencyRecord {
+export interface Checkpoint<T> {
   noteId: string;
   contentHash: string;
-  fingerprint: string;
-  createdAt: number;
+  /** Whatever the operation knows so far (attribute results, warnings). */
+  partial: Partial<T>;
 }
 
-interface Entry {
+export interface IdempotencyRecord<T> {
   fingerprint: string;
   createdAt: number;
-  record?: IdempotencyRecord;
-  inFlight?: Promise<IdempotencyRecord>;
+  /** Set once the whole operation finished; replays return this outcome. */
+  outcome?: T;
+  /** Set as soon as the note exists upstream; survives later failures. */
+  checkpoint?: Checkpoint<T>;
+  /** The error that ended an operation after its checkpoint. */
+  failure?: { code: string; message: string };
+}
+
+interface Entry<T> {
+  fingerprint: string;
+  createdAt: number;
+  record?: IdempotencyRecord<T>;
+  inFlight?: Promise<IdempotencyRecord<T>>;
 }
 
 export class IdempotencyKeyMismatch extends Error {
@@ -34,8 +45,8 @@ export function fingerprintOf(payload: unknown): string {
   return createHash('sha256').update(JSON.stringify(payload)).digest('base64url').slice(0, 32);
 }
 
-export class IdempotencyStore {
-  private readonly entries = new Map<string, Entry>();
+export class IdempotencyStore<T = unknown> {
+  private readonly entries = new Map<string, Entry<T>>();
   private readonly ttlMs: number;
   private readonly maxEntries: number;
   private readonly now: () => number;
@@ -50,7 +61,7 @@ export class IdempotencyStore {
     return `${principal}\u0000${key}`;
   }
 
-  private live(entry: Entry | undefined, key: string): Entry | undefined {
+  private live(entry: Entry<T> | undefined, key: string): Entry<T> | undefined {
     if (!entry) return undefined;
     if (!entry.inFlight && this.now() - entry.createdAt > this.ttlMs) {
       this.entries.delete(key);
@@ -60,18 +71,24 @@ export class IdempotencyStore {
   }
 
   /**
-   * Run `create` exactly once per (principal, key). A second caller with the
-   * same key and fingerprint receives the first caller's record (`replayed`);
-   * a caller with a different fingerprint gets IdempotencyKeyMismatch.
+   * Run `create` at most once per (principal, key).
+   *
+   * - A caller arriving while the first run is still in flight waits for it to
+   *   finish and then receives the same record (`replayed: true`).
+   * - A caller with the same key but a different fingerprint gets
+   *   IdempotencyKeyMismatch.
+   * - `checkpoint` lets the operation persist the note id (and partial results)
+   *   as soon as the note exists; a failure after that keeps the record with
+   *   `failure` set, so retries neither create a second note nor pretend the
+   *   original completed.
    */
   async execute(
     principal: string,
     key: string,
     fingerprint: string,
-    create: (
-      record: (partial: Omit<IdempotencyRecord, 'fingerprint' | 'createdAt'>) => void,
-    ) => Promise<Omit<IdempotencyRecord, 'fingerprint' | 'createdAt'>>,
-  ): Promise<{ record: IdempotencyRecord; replayed: boolean }> {
+    create: (checkpoint: (c: Checkpoint<T>) => void) => Promise<T>,
+    describeFailure: (err: unknown) => { code: string; message: string },
+  ): Promise<{ record: IdempotencyRecord<T>; replayed: boolean }> {
     const k = this.key(principal, key);
     const existing = this.live(this.entries.get(k), k);
     if (existing) {
@@ -79,26 +96,34 @@ export class IdempotencyStore {
         throw new IdempotencyKeyMismatch(
           `idempotencyKey '${key}' was already used with a different request`,
         );
-      if (existing.record) return { record: existing.record, replayed: true };
       if (existing.inFlight) return { record: await existing.inFlight, replayed: true };
+      if (existing.record) return { record: existing.record, replayed: true };
     }
     if (this.entries.size >= this.maxEntries) {
       const oldest = this.entries.keys().next().value;
       if (oldest !== undefined) this.entries.delete(oldest);
     }
-    const entry: Entry = { fingerprint, createdAt: this.now() };
-    // `record` lets the operation persist the note id as soon as it exists, so a
-    // failure later in the operation (attributes, final read) does not lose it.
-    const commit = (partial: Omit<IdempotencyRecord, 'fingerprint' | 'createdAt'>) => {
-      entry.record = { ...partial, fingerprint, createdAt: this.now() };
+    const entry: Entry<T> = { fingerprint, createdAt: this.now() };
+    const base = (): IdempotencyRecord<T> => ({ fingerprint, createdAt: this.now() });
+    let checkpointed: Checkpoint<T> | undefined;
+    const checkpoint = (c: Checkpoint<T>) => {
+      checkpointed = c;
     };
     entry.inFlight = (async () => {
       try {
-        const result = await create(commit);
-        commit(result);
-        return entry.record!;
+        const outcome = await create(checkpoint);
+        entry.record = {
+          ...base(),
+          outcome,
+          ...(checkpointed ? { checkpoint: checkpointed } : {}),
+        };
+        return entry.record;
       } catch (err) {
-        if (entry.record) return entry.record; // upstream create succeeded; keep it
+        if (checkpointed) {
+          // The note exists; remember it together with why the call failed.
+          entry.record = { ...base(), checkpoint: checkpointed, failure: describeFailure(err) };
+          throw err;
+        }
         this.entries.delete(k);
         throw err;
       } finally {
@@ -106,10 +131,19 @@ export class IdempotencyStore {
       }
     })();
     this.entries.set(k, entry);
-    return { record: await entry.inFlight, replayed: false };
+    // The first caller sees the failure. Concurrent waiters get the record when
+    // the note exists, or the same failure when nothing was created (so they can retry).
+    const inFlight = entry.inFlight;
+    const waiterView = inFlight.catch((err: unknown) => {
+      if (entry.record) return entry.record;
+      throw err;
+    });
+    waiterView.catch(() => undefined); // waiters that never arrive must not surface as unhandled
+    entry.inFlight = waiterView;
+    return { record: await inFlight, replayed: false };
   }
 
-  get(principal: string, key: string): IdempotencyRecord | undefined {
+  get(principal: string, key: string): IdempotencyRecord<T> | undefined {
     const k = this.key(principal, key);
     return this.live(this.entries.get(k), k)?.record;
   }

@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import type { AppConfig } from './config.js';
 import { loadConfig } from './config.js';
 import { IdempotencyStore } from './domain/idempotency.js';
-import { createServices, type Services } from './domain/services.js';
+import { createServices, type CreateNoteResult, type Services } from './domain/services.js';
 import { TriliumClient, type FetchLike } from './etapi/client.js';
 import { createAuditLog, createLogger, type AuditLog, type Logger } from './logging/logger.js';
 
@@ -63,7 +63,7 @@ export function createAppContext(
   const services = createServices({
     client,
     limits: config.limits,
-    idempotency: new IdempotencyStore(),
+    idempotency: new IdempotencyStore<CreateNoteResult>(),
   });
   return { config, logger, audit, client, services };
 }

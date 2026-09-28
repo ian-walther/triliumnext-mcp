@@ -93,6 +93,10 @@ export function writeTools(services: Services): AnyToolDefinition[] {
           attributeResults: z.array(attributeOpResultSchema),
           warnings: z.array(z.string()),
           idempotentReplay: z.boolean(),
+          incomplete: z
+            .boolean()
+            .optional()
+            .describe('Replay of a request that failed after the note was created; see warnings'),
         }),
         annotations: {
           title: 'Create note',
@@ -107,7 +111,11 @@ export function writeTools(services: Services): AnyToolDefinition[] {
         const created = await services.notes.create({ ...args, principal: ctx.principal.id });
         return withAudit(ok(created), {
           noteIds: [args.parentNoteId ?? 'root', created.note.noteId],
-          ...(created.attributeResults.some((r) => !r.ok) ? { code: 'PARTIAL' } : {}),
+          ...(created.incomplete
+            ? { code: 'INCOMPLETE' }
+            : created.attributeResults.some((r) => !r.ok)
+              ? { code: 'PARTIAL' }
+              : {}),
         });
       },
     }),

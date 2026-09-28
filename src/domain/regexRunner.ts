@@ -17,7 +17,8 @@ export interface RegexMatch {
   length: number;
   /** m[0], m[1], ... as returned by RegExp.exec (undefined for unmatched groups). */
   captures: (string | undefined)[];
-  groups?: Record<string, string | undefined>;
+  /** Named groups, or null/undefined when the pattern declares none. */
+  groups?: Record<string, string | undefined> | null;
 }
 
 export interface ScanResult {
@@ -87,7 +88,7 @@ while ((m = re.exec(content)) !== null) {
   }
   total += 1;
   if (matches.length < maxMatches) {
-    matches.push({ index: m.index, length: m[0].length, captures: Array.from(m), groups: m.groups ? { ...m.groups } : undefined });
+    matches.push({ index: m.index, length: m[0].length, captures: Array.from(m), groups: m.groups ? { ...m.groups } : null });
   }
   if (total >= maxTotal) { truncated = true; break; }
 }
@@ -152,13 +153,18 @@ export function expandReplacement(
 ): string {
   if (literal) return template;
   return template.replace(
-    /\$(\$|&|`|'|\d{1,2}|<([^>]+)>)/g,
+    /\$(\$|&|`|'|\d{1,2}|<([^>]*)>)/g,
     (whole, token: string, name: string | undefined) => {
       if (token === '$') return '$';
       if (token === '&') return match.captures[0] ?? '';
       if (token === '`') return content.slice(0, match.index);
       if (token === "'") return content.slice(match.index + match.length);
-      if (name !== undefined) return match.groups?.[name] ?? '';
+      if (token.startsWith('<')) {
+        // JavaScript keeps "$<name>" literal when the pattern has no named groups,
+        // and substitutes the empty string for an unknown or unmatched name otherwise.
+        if (match.groups === undefined || match.groups === null) return whole;
+        return match.groups[name ?? ''] ?? '';
+      }
       const n = Number(token);
       if (n >= 1 && n < match.captures.length) return match.captures[n] ?? '';
       if (token.length === 2) {

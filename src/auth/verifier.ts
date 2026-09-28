@@ -44,10 +44,11 @@ export function createStaticVerifier(tokens: StaticToken[]): OAuthTokenVerifier 
  * Delegated scopes from a token.
  *
  * `claimNames` is an ordered preference list; the FIRST claim present in the
- * token decides and the others are ignored. Claims are never unioned: with
- * Auth0 RBAC, `scope` carries what the client was granted while `permissions`
- * lists everything the user holds, so a union would widen a read-only
- * delegation into write access.
+ * token decides and the others are ignored. Claims are never unioned, and the
+ * default list (`scope`, `scp`) contains only delegated-scope claims: Auth0's
+ * user-wide `permissions` claim is not a delegation and is consulted only when
+ * an operator lists it explicitly. A token with no delegated-scope claim gets
+ * no scopes (fail closed).
  */
 export function scopesFromClaims(payload: JWTPayload, claimNames: string[]): Scope[] {
   for (const claim of claimNames) {

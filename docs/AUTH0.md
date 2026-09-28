@@ -22,7 +22,10 @@ tokens Auth0 issues and never mints any.
    connection so those apps can log users in, and expect a consent screen on
    first use.
 4. **Users**: one user (you). Assign the API permissions to the user (User →
-   Permissions) so RBAC puts them in the `permissions` claim.
+   Permissions). With RBAC on, Auth0 puts the _requested_ permissions the user
+   holds into the token's `scope` claim; that delegated `scope` is what this
+   server authorizes on. The user-wide `permissions` claim is ignored by
+   default, so a client only ever gets the scopes it asked for.
 5. **Grok / clients without DCR**: create a Regular Web Application manually,
    note client id/secret, allow the client's callback URL, and paste the
    credentials into the connector UI.
@@ -34,7 +37,7 @@ MCP_AUTH_MODE=oidc
 MCP_OIDC_ISSUER=https://<tenant>.us.auth0.com/
 MCP_PUBLIC_URL=https://mcp.ianwalther.com/trilium/mcp
 MCP_OIDC_AUDIENCE=https://mcp.ianwalther.com/trilium/mcp
-MCP_OIDC_SCOPE_CLAIMS=scope,permissions
+# MCP_OIDC_SCOPE_CLAIMS=scope,scp   # default; do not add `permissions` (user-wide, not delegated)
 ```
 
 The server publishes `/.well-known/oauth-protected-resource/trilium/mcp` with
@@ -66,4 +69,6 @@ curl -s https://mcp.ianwalther.com/trilium/mcp -X POST \
 ```
 
 A `403 insufficient_scope` means the token verified but carries none of the
-`trilium.*` scopes: check the RBAC and default-audience settings.
+`trilium.*` scopes in its `scope` claim: the client must request them (they are
+advertised in the protected-resource metadata's `scopes_supported`), the user
+must hold the matching permissions, and RBAC must be enabled on the API.

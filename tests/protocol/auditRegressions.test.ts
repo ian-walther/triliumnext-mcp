@@ -87,13 +87,11 @@ describe('F01 delegated scopes', () => {
     expect(h.fake.notes.get('plumb')?.content).toBe('<p>Fix the sink</p>');
   });
 
-  it('falls back to permissions only when no scope claim is present', async () => {
+  it('grants nothing when no delegated-scope claim is present (see R1)', async () => {
     const { h, sign } = await oidcHarness();
     harness = h;
     const client = await connect(h, await sign({ permissions: ['trilium.write'] }));
-    const names = (await client.listTools()).tools.map((t) => t.name);
-    expect(names).toContain('patch_note');
-    expect(names).not.toContain('get_note');
+    expect((await client.listTools()).tools).toEqual([]);
   });
 });
 

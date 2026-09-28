@@ -11,6 +11,7 @@ import { DomainError } from '../domain/errors.js';
 import type { Services } from '../domain/services.js';
 import type { AuditLog, Logger } from '../logging/logger.js';
 import { hasScope, type Principal } from './policy.js';
+import { auditedSchema } from './auditedSchema.js';
 import { auditMetaOf, fail } from './results.js';
 import { readTools } from './tools/read.js';
 import type { AnyToolDefinition } from './tools/types.js';
@@ -62,7 +63,26 @@ export function buildServer(options: BuildServerOptions): McpServer {
   );
 
   for (const tool of toolsForScopes(services, principal.scopes)) {
-    server.registerTool(tool.name, tool.config, async (args): Promise<CallToolResult> => {
+    // The SDK validates arguments before dispatch; wrapping the schema's validate
+    // keeps that behaviour and the advertised JSON schema while making rejections
+    // auditable (safe metadata only: field names and a count, never values).
+    const inputSchema = auditedSchema(tool.config.inputSchema, (rejection) => {
+      audit.record({
+        principal: principal.id,
+        client: principal.clientId,
+        ...(principal.subject !== undefined ? { subject: principal.subject } : {}),
+        transport: principal.transport,
+        tool: tool.name,
+        noteIds: [],
+        ok: false,
+        code: 'INVALID_ARGUMENTS',
+        durationMs: 0,
+        era,
+        details: { invalidFields: rejection.fields, issueCount: rejection.issueCount },
+      });
+    });
+    const config = { ...tool.config, inputSchema };
+    server.registerTool(tool.name, config, async (args): Promise<CallToolResult> => {
       const started = now();
       let noteIds: string[] = [];
       try {

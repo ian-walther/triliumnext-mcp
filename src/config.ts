@@ -310,7 +310,7 @@ export function loadConfig(
       ...(jwksUrl !== undefined ? { jwksUrl } : {}),
       scopeClaims: envList(env, 'MCP_OIDC_SCOPE_CLAIMS').length
         ? envList(env, 'MCP_OIDC_SCOPE_CLAIMS')
-        : ['scope', 'scp', 'permissions'],
+        : ['scope', 'scp'],
       algorithms: envList(env, 'MCP_OIDC_ALGORITHMS').length
         ? envList(env, 'MCP_OIDC_ALGORITHMS')
         : [

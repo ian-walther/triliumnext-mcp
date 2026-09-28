@@ -414,8 +414,14 @@ export function trimUtf8(buf: Buffer): Buffer {
 }
 
 async function readTextBounded(response: Response, maxBytes: number): Promise<BoundedText> {
-  const declared = Number(response.headers.get('content-length'));
-  const totalFromHeader = Number.isFinite(declared) && declared >= 0 ? declared : undefined;
+  // Content-Length is only meaningful when present, numeric, and describing the
+  // decoded body (no content-encoding). Number(null) would be 0, so parse explicitly.
+  const declaredRaw = response.headers.get('content-length');
+  const encoding = response.headers.get('content-encoding');
+  const totalFromHeader =
+    declaredRaw !== null && /^\d+$/.test(declaredRaw) && (!encoding || encoding === 'identity')
+      ? Number(declaredRaw)
+      : undefined;
   if (!response.body) {
     const text = await response.text();
     const bytes = Buffer.from(text, 'utf8');
