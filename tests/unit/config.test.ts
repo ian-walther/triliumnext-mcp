@@ -33,6 +33,14 @@ describe('loadConfig', () => {
     ]);
     expect(() => parseScopes('bogus', 'X')).toThrow(/unknown scope/);
   });
+  it('parses the response mode', () => {
+    expect(loadConfig(base).http.responseMode).toBe('auto');
+    expect(loadConfig({ ...base, MCP_HTTP_RESPONSE_MODE: 'json' }).http.responseMode).toBe('json');
+    expect(() => loadConfig({ ...base, MCP_HTTP_RESPONSE_MODE: 'xml' })).toThrow(
+      /MCP_HTTP_RESPONSE_MODE/,
+    );
+  });
+
   it('refuses unauthenticated non-loopback binds', () => {
     expect(() => loadConfig({ ...base, MCP_HTTP_HOST: '0.0.0.0', MCP_AUTH_MODE: 'none' })).toThrow(
       /loopback/,

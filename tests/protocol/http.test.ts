@@ -119,6 +119,36 @@ describe('HTTP transport (auth none, loopback)', () => {
     expect(names).toContain('search_notes');
   });
 
+  it('json response mode answers 2026-era requests with plain JSON; 2025-era requests keep SSE', async () => {
+    harness = createHarness({ MCP_HTTP_RESPONSE_MODE: 'json' });
+    const seen: string[] = [];
+    const client = new Client(
+      { name: 'json', version: '1' },
+      { versionNegotiation: { mode: 'auto' } },
+    );
+    const transport = new StreamableHTTPClientTransport(new URL(URL_), {
+      fetch: async (url, init) => {
+        const res = await harness!.fetch(url, init);
+        seen.push(res.headers.get('content-type') ?? '');
+        return res;
+      },
+    });
+    clients.push(client);
+    await client.connect(transport);
+    const call = await client.callTool({ name: 'get_note', arguments: { noteId: 'plumb' } });
+    expect(call.isError).toBeFalsy();
+    expect(seen.at(-1)).toMatch(/^application\/json/);
+    const legacy = await harness.fetch(URL_, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    expect(legacy.headers.get('content-type')).toMatch(/^text\/event-stream/);
+  });
+
   it('exposes a health endpoint without note content', async () => {
     harness = createHarness({}, { healthCacheMs: 0 });
     const res = await harness.fetch('http://127.0.0.1:3939/healthz');

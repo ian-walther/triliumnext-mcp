@@ -55,6 +55,8 @@ export interface AppConfig {
     maxBodyBytes: number;
     rateLimit: { perMinute: number; burst: number };
     legacy: 'stateless' | 'reject';
+    /** Response framing: 'auto' streams SSE when a handler emits notifications, 'json' never streams. */
+    responseMode: 'auto' | 'json' | 'sse';
     trustProxy: boolean;
   };
   auth: {
@@ -363,6 +365,12 @@ export function loadConfig(
         burst: envInt(env, 'MCP_RATE_LIMIT_BURST', 30, 1),
       },
       legacy: envEnum(env, 'MCP_HTTP_LEGACY', ['stateless', 'reject'] as const, 'stateless'),
+      responseMode: envEnum(
+        env,
+        'MCP_HTTP_RESPONSE_MODE',
+        ['auto', 'json', 'sse'] as const,
+        'auto',
+      ),
       trustProxy: envBool(env, 'MCP_TRUST_PROXY', false),
     },
     auth: { mode: authMode, staticTokens, oidc, anonymousScopes },

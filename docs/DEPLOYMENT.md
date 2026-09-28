@@ -1,132 +1,152 @@
 # Deployment
 
-Target: one container on server.home (or any host that can reach Trilium
-privately), published through the existing reverse proxy at a stable HTTPS URL,
-with Auth0 (or another OIDC provider) issuing tokens. Nothing in this document
-has been applied yet; it is the checklist for the cutover phase.
-
-## 1. Build the image
-
-```bash
-docker build -t trilium-mcp:2.0.0 .
-```
-
-Multi-stage: compiles with dev dependencies, ships `dist/` plus production
-`node_modules` on `node:24-alpine`, runs as user `mcp`, exposes 3939, has a
-`HEALTHCHECK` on `/healthz`.
-
-## 2. Environment
-
-Create `/etc/trilium-mcp/env` (or the secret store of your choice) from
-`.env.example`. Production shape:
+Target, as built on 2026-09-28: one container on **server.home** (Ubuntu, Docker
+Compose, `~/docker` layout), published at **https://trilium-mcp.ianwalther.com/mcp**
+through the **OPNsense nginx plugin**, which terminates TLS for every public
+hostname with one shared Let's Encrypt certificate. Auth0 issues tokens.
 
 ```
-TRILIUM_API_URL=http://trilium:8080/etapi          # private network address of Trilium
-TRILIUM_API_TOKEN=<etapi token dedicated to this service>
-MCP_HTTP_HOST=0.0.0.0
-MCP_HTTP_PORT=3939
-MCP_HTTP_PATH=/trilium/mcp
-MCP_PUBLIC_URL=https://mcp.ianwalther.com/trilium/mcp
-MCP_ALLOWED_HOSTS=mcp.ianwalther.com
-MCP_AUTH_MODE=oidc
-MCP_OIDC_ISSUER=https://<tenant>.us.auth0.com/
-MCP_OIDC_AUDIENCE=https://mcp.ianwalther.com/trilium/mcp
-MCP_TRUST_PROXY=true
-MCP_RATE_LIMIT_PER_MINUTE=120
-LOG_FORMAT=json
-MCP_AUDIT_LOG_PATH=/var/log/trilium-mcp/audit.jsonl
+Claude / ChatGPT / Grok ── HTTPS ──▶ OPNsense nginx (TLS, one cert for *.ianwalther.com names)
+                                         │ http, Host/X-Forwarded-* preserved
+                                         ▼
+                              server.home:3939  (trilium-mcp container)
+                                         │ http://trilium:8080/etapi on server_default
+                                         ▼
+                              server-trilium-1  (TriliumNext, private)
 ```
 
-Create a _separate_ ETAPI token in Trilium for this service so it can be
-revoked independently of the local stdio token.
+## 1. server.home: compose layout
 
-## 3. Compose
+Every service lives in `~/docker/<service>/` with its own `docker-compose.yml`
+and data directories, and the parent `~/docker/docker-compose.yml` (`name:
+server`) includes each file so all services share the `server_default` network.
+trilium-mcp follows the same pattern, building from a clone of this repository:
+
+```
+~/docker/trilium-mcp/
+  docker-compose.yml     # below
+  .env                   # secrets (chmod 600), never in git
+  data/                  # audit.jsonl (owned by uid 1000)
+  trilium-mcp/           # git clone, branch v2
+```
+
+`~/docker/trilium-mcp/docker-compose.yml`:
 
 ```yaml
 services:
   trilium-mcp:
-    image: trilium-mcp:2.0.0
+    build: ./trilium-mcp
+    image: trilium-mcp:local
+    container_name: trilium-mcp
     restart: unless-stopped
-    env_file: /etc/trilium-mcp/env
+    user: '1000:1000'
+    env_file: .env
+    environment:
+      - TRILIUM_API_URL=http://trilium:8080/etapi
+      - MCP_HTTP_HOST=0.0.0.0
+      - MCP_HTTP_PORT=3939
+      - MCP_HTTP_PATH=/mcp
+      - MCP_PUBLIC_URL=https://trilium-mcp.ianwalther.com/mcp
+      - MCP_ALLOWED_HOSTS=trilium-mcp.ianwalther.com,trilium-mcp.home,server.home
+      - MCP_TRUST_PROXY=true
+      - MCP_HTTP_RESPONSE_MODE=json
+      - MCP_AUDIT_LOG_PATH=/var/log/trilium-mcp/audit.jsonl
+      - LOG_FORMAT=json
+    ports:
+      - '3939:3939'
     volumes:
-      - /var/log/trilium-mcp:/var/log/trilium-mcp
-    networks: [proxy, trilium] # reach Trilium privately; expose only to the proxy
-    # no `ports:` — the reverse proxy talks to it on the compose network
+      - ./data:/var/log/trilium-mcp
 ```
 
-## 4. Reverse proxy
+`.env` holds `TRILIUM_API_TOKEN` (a dedicated ETAPI token, revocable on its
+own), `MCP_AUTH_MODE`, and in `oidc` mode `MCP_OIDC_ISSUER`. Before Auth0 exists
+the service runs with `MCP_AUTH_MODE=static` and one long random
+`MCP_STATIC_TOKENS` entry for smoke tests; that is development auth, not the
+end state.
 
-Route `https://mcp.ianwalther.com/trilium/*` to `trilium-mcp:3939`, preserving
-the path. Requirements:
-
-- TLS terminated at the proxy (bearer tokens must never travel in clear).
-- Pass `Host` through unchanged (`MCP_ALLOWED_HOSTS` checks it).
-- Pass `X-Forwarded-For` (used only for anonymous rate-limit keys).
-- No buffering of `text/event-stream` responses (SSE); disable proxy read
-  timeouts below ~5 minutes for the MCP path.
-- Allow `GET`, `POST`, `DELETE` on the MCP path and `GET` on
-  `/.well-known/oauth-protected-resource*`.
-- Do **not** expose Trilium itself.
-
-Caddy example (keeps the `/trilium` prefix; the server is configured with
-`MCP_HTTP_PATH=/trilium/mcp` and serves `/trilium/healthz` too):
-
-```
-mcp.ianwalther.com {
-  handle /trilium/* {
-    reverse_proxy trilium-mcp:3939 {
-      flush_interval -1
-    }
-  }
-  handle /.well-known/oauth-protected-resource* {
-    reverse_proxy trilium-mcp:3939
-  }
-}
-```
-
-Do not use `handle_path`, which strips the prefix: the server would then receive
-`/mcp` and answer 404. If you prefer stripping, set `MCP_HTTP_PATH=/mcp` and
-keep `MCP_PUBLIC_URL` at the public `/trilium/mcp`; the well-known route must
-still reach the container unstripped
-(`/.well-known/oauth-protected-resource/trilium/mcp`), which the server serves
-alongside the bare `/.well-known/oauth-protected-resource`.
-
-Origin: off loopback the server accepts browser `Origin` headers only for the
-hostnames in `MCP_ALLOWED_HOSTS` / `MCP_PUBLIC_URL` (set `MCP_ALLOWED_ORIGINS`
-to widen). Non-browser MCP clients send no `Origin` and are unaffected.
-
-## 5. Identity provider
-
-See [AUTH0.md](AUTH0.md). Summary: create an API with identifier equal to
-`MCP_PUBLIC_URL`, define permissions `trilium.read`, `trilium.write`,
-`trilium.admin`, enable dynamic client registration (or register each client),
-set the API as the tenant's default audience.
-
-## 6. Smoke test before cutover
+Add `- ./trilium-mcp/docker-compose.yml` to the parent file's `include:` list,
+then from `~/docker`:
 
 ```bash
-curl -s https://mcp.ianwalther.com/trilium/healthz   # cached probe; rate limited per peer
-curl -si https://mcp.ianwalther.com/trilium/mcp -X POST -H 'content-type: application/json' \
-  -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
-# expect 401 with WWW-Authenticate: Bearer resource_metadata="https://mcp.ianwalther.com/.well-known/oauth-protected-resource/trilium/mcp"
-curl -s https://mcp.ianwalther.com/.well-known/oauth-protected-resource/trilium/mcp
+docker compose build trilium-mcp
+docker compose up -d trilium-mcp
+curl -s http://127.0.0.1:3939/healthz          # {"status":"ok",...}
 ```
 
-Then connect Claude (Settings → Connectors → Add custom connector) with the MCP
-URL, complete the OAuth flow, and run `search_notes` and `get_note` on a known
-note. Repeat with Grok and ChatGPT. Compare results with the old server per
-[MIGRATION.md](MIGRATION.md).
+Update: `git -C ~/docker/trilium-mcp/trilium-mcp pull`, rebuild, `up -d`.
 
-## 7. Operations
+`MCP_HTTP_RESPONSE_MODE=json` makes 2026-era answers plain JSON; 2025-era
+answers are short SSE streams that close with the result, which a buffering
+proxy delivers intact (the OPNsense location has buffering off regardless). `user: '1000:1000'`
+runs the process as your uid so `./data` stays writable; the image's own `mcp`
+user is only the default.
 
-- Logs: stderr JSON lines (`docker logs`). Audit: `/var/log/trilium-mcp/audit.jsonl`.
-- Rotate the ETAPI token by updating the env file and restarting; no client changes.
-- Rotate signing keys at the IdP freely; JWKS is fetched and cached (30 s cooldown).
-- Upgrade: build a new image, `docker compose up -d`. The server is stateless
-  except for the in-memory idempotency store and rate-limit buckets.
-- Rollback: the old `triliumnext-mcp` stdio configurations keep working
-  throughout; nothing here touches them. The legacy reference is branch
-  `tool_defs` (0.3.13 plus output schemas) and the preserved local `build/`,
-  not `main` (which was fast-forwarded to upstream 0.3.17).
-- Single instance: idempotency keys, per-note write serialization and rate
-  limits are process-local. Run one replica.
+LAN access follows the existing `*.home` convention on server.home's nginx
+(`~/docker/nginx/conf.d/trilium-mcp.home.conf`, plain HTTP, proxied to
+`127.0.0.1:3939`), which is why `trilium-mcp.home` is in the Host allow-list.
+
+## 2. OPNsense: certificate and nginx
+
+The ACME client holds one certificate (`ianwalther.com`, HTTP-01 through the
+firewall's own challenge port, auto-renewal, "Restart Nginx" action). Adding a
+hostname means adding it to that certificate's alt names and re-signing.
+
+Nginx plugin objects, cloned from the Trilium entries (created 2026-09-28
+through the API; note the API model keys differ from the settings dump:
+`httpserver`, `location`, `upstream`, `upstream_server`, and the ACME
+certificate is changed with `certificates/update/<uuid>`, since `set` reports
+success without applying):
+
+| Object          | Value                                                                                                                   |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Upstream server | `server.home`, port `3939`                                                                                              |
+| Upstream pool   | `Trilium-MCP Pool` → that server                                                                                        |
+| Location        | `/`, match `^~`, upstream the pool, **proxy buffering off**, websocket on (harmless), security rules off (as elsewhere) |
+| HTTP server     | `trilium-mcp.ianwalther.com`, certificate `ianwalther.com`, HTTPS only, HTTP/2, **bot protection disabled**             |
+
+Bot protection is the per-server user-agent blocklist that answers `418` and
+bans the source IP for `ban_ttl`. Cloud MCP clients share egress IPs across
+customers; one unlucky user agent would ban a vendor, so it stays off for this
+host only.
+
+Headers OPNsense already forwards (`Host`, `X-Real-IP`, `X-Forwarded-For`,
+`X-Forwarded-Proto`) are what `MCP_TRUST_PROXY=true` and the Host allow-list
+expect. Its default `proxy_read_timeout` (60 s) exceeds every bound in this
+server (ETAPI 30 s, regex 2 s).
+
+## 3. Smoke test from outside
+
+```bash
+curl -s https://trilium-mcp.ianwalther.com/healthz
+curl -si https://trilium-mcp.ianwalther.com/mcp -X POST -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+# 401 with WWW-Authenticate: Bearer resource_metadata="https://trilium-mcp.ianwalther.com/.well-known/oauth-protected-resource/mcp"
+curl -s https://trilium-mcp.ianwalther.com/.well-known/oauth-protected-resource/mcp
+```
+
+With a static token, add `-H 'authorization: Bearer <token>'` to the `ping` and
+expect a JSON-RPC result. The protected-resource metadata document is served
+only in `oidc` mode; in `static` mode it answers 404 while the `401` challenge
+still names it.
+
+## 4. Identity provider
+
+See [AUTH0.md](AUTH0.md). API identifier = `https://trilium-mcp.ianwalther.com/mcp`.
+Then set `MCP_AUTH_MODE=oidc`, `MCP_OIDC_ISSUER=https://<tenant>.us.auth0.com/`
+in `.env`, drop the static token, and `docker compose up -d trilium-mcp`.
+
+## 5. Clients
+
+Claude (Settings → Connectors → Add custom connector) with the MCP URL, complete
+the OAuth flow, run `search_notes` and `get_note` on a known note; then Grok and
+ChatGPT. Compare with the old server per [MIGRATION.md](MIGRATION.md).
+
+## 6. Operations
+
+- Logs: `docker logs trilium-mcp` (JSON lines). Audit: `~/docker/trilium-mcp/data/audit.jsonl`.
+- Rotate the ETAPI token by editing `.env` and restarting; clients are unaffected.
+- Signing keys rotate at Auth0 freely; JWKS is fetched and cached (30 s cooldown).
+- One replica only: idempotency keys, per-note write locks and rate limits are process-local.
+- Rollback: the legacy reference is branch `tool_defs` (0.3.13 plus output
+  schemas) and the preserved local `build/`, not `main`; the old stdio
+  configurations keep working throughout.

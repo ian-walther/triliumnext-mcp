@@ -68,7 +68,7 @@ export function createHttpTransport(
         logger,
       });
     },
-    { legacy: http.legacy },
+    { legacy: http.legacy, responseMode: http.responseMode },
   );
 
   // Host validation: the SDK app validates automatically on loopback binds; off
