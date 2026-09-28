@@ -7,6 +7,8 @@
 import type { TriliumClient } from '../etapi/client.js';
 import { EtapiError } from '../etapi/errors.js';
 import { DomainError } from './errors.js';
+import { HIERARCHY_LOCK } from './hierarchy.js';
+import { KeyedMutex } from './keyedMutex.js';
 import { toNoteDetail, toNoteSummary, type NoteDetail, type NoteSummary } from './model.js';
 import { quote } from './query/builder.js';
 import { fetchNote, isSystemNoteId } from './shared.js';
@@ -48,7 +50,14 @@ export interface UndeleteNoteResult {
 export const MAX_DESCENDANT_COUNT = 1000;
 
 export class DeletionService {
-  constructor(private readonly client: TriliumClient) {}
+  private readonly mutex: KeyedMutex;
+
+  constructor(
+    private readonly client: TriliumClient,
+    mutex?: KeyedMutex,
+  ) {
+    this.mutex = mutex ?? new KeyedMutex();
+  }
 
   async plan(noteId: string): Promise<DeletePlan> {
     const note = await fetchNote(this.client, noteId);
@@ -73,7 +82,18 @@ export class DeletionService {
     };
   }
 
-  async deleteNote(input: DeleteNoteInput): Promise<DeleteNoteResult> {
+  /**
+   * The title/descendant checks and the DELETE run under the process-wide
+   * hierarchy lock, so no create, move, rename, undelete or other delete handled
+   * by this process can slip in between (AUDIT R10). Writers outside this
+   * process (Trilium UI, another replica) are not covered: ETAPI has no
+   * transaction spanning these steps.
+   */
+  deleteNote(input: DeleteNoteInput): Promise<DeleteNoteResult> {
+    return this.mutex.run(HIERARCHY_LOCK, () => this.deleteUnlocked(input));
+  }
+
+  private async deleteUnlocked(input: DeleteNoteInput): Promise<DeleteNoteResult> {
     if (isSystemNoteId(input.noteId)) {
       throw DomainError.validation(
         "The root note and Trilium system notes (ids starting with '_') cannot be deleted",
@@ -142,7 +162,11 @@ export class DeletionService {
     return { ...plan, deleted: true, dryRun: false, undeletable: true, warnings };
   }
 
-  async undeleteNote(noteId: string): Promise<UndeleteNoteResult> {
+  undeleteNote(noteId: string): Promise<UndeleteNoteResult> {
+    return this.mutex.run(HIERARCHY_LOCK, () => this.undeleteUnlocked(noteId));
+  }
+
+  private async undeleteUnlocked(noteId: string): Promise<UndeleteNoteResult> {
     if (isSystemNoteId(noteId)) throw DomainError.validation('Invalid noteId');
     const live = await this.client.getNote(noteId).then(
       (note) => note,

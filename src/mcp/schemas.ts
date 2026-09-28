@@ -159,7 +159,10 @@ export const branchSchema = z.object({
 
 export const base64Schema = z
   .string()
-  .regex(/^[A-Za-z0-9+/\r\n]*={0,2}$/, 'contentBase64 must be standard base64')
+  .regex(
+    /^(data:[^,]{0,200},)?[A-Za-z0-9+/\s]*={0,2}\s*$/,
+    'contentBase64 must be standard base64, optionally as a data:<mime>;base64, URI',
+  )
   .describe(
     'Binary content as standard base64 (a data: URI is also accepted). Decoded size is limited by MCP_MAX_WRITE_CONTENT_BYTES.',
   );

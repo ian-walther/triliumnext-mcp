@@ -3,7 +3,7 @@
  * into a text note, files attached to it). Content writes are hash-protected
  * like note content.
  */
-import type { TriliumClient } from '../etapi/client.js';
+import { trimUtf8, type TriliumClient } from '../etapi/client.js';
 import { EtapiError } from '../etapi/errors.js';
 import type { EtapiAttachment } from '../etapi/types.js';
 import { decodeBinaryInput, defaultAttachmentRole, isImageMime, isTextMime } from './binary.js';
@@ -135,7 +135,10 @@ export class AttachmentsService {
     }
     if (bounded.totalBytes !== undefined) result.contentBytes = bounded.totalBytes;
     if (isTextMime(raw.mime)) {
-      result.content = bounded.bytes.toString('utf8');
+      // A cut never splits a code point (AUDIT R14).
+      result.content = (bounded.truncated ? trimUtf8(bounded.bytes) : bounded.bytes).toString(
+        'utf8',
+      );
       result.contentTruncated = bounded.truncated;
       return result;
     }
@@ -194,14 +197,24 @@ export class AttachmentsService {
 
   private async updateUnlocked(input: UpdateAttachmentInput): Promise<UpdateAttachmentResult> {
     const current = await this.fetch(input.attachmentId);
+    // Trilium persists blank mime/role and then cannot load the attachment again
+    // (AUDIT R11), so every provided field is validated before any mutation.
     const patch: { title?: string; mime?: string; role?: string; position?: number } = {};
     if (input.title !== undefined) {
       const title = input.title.trim();
       if (!title) throw DomainError.validation('title must not be empty');
       patch.title = title;
     }
-    if (input.mime !== undefined) patch.mime = input.mime.trim();
-    if (input.role !== undefined) patch.role = input.role.trim();
+    if (input.mime !== undefined) {
+      const mime = input.mime.trim();
+      if (!mime) throw DomainError.validation('mime must not be empty');
+      patch.mime = mime;
+    }
+    if (input.role !== undefined) {
+      const role = input.role.trim();
+      if (!role) throw DomainError.validation("role must not be empty ('file' or 'image')");
+      patch.role = role;
+    }
     if (input.position !== undefined) patch.position = input.position;
     const hasContent = input.content !== undefined || input.contentBase64 !== undefined;
     if (!hasContent && Object.keys(patch).length === 0) {
@@ -209,9 +222,11 @@ export class AttachmentsService {
         'Provide at least one of title, mime, role, position, content, contentBase64',
       );
     }
+    // Decode (and size-check) new content before touching anything.
+    const body = hasContent ? this.bodyOf(input, 'update_attachment') : undefined;
     const changed: string[] = [];
     let previousHash: string | undefined;
-    if (hasContent) {
+    if (body) {
       if (!input.expectedHash) {
         throw DomainError.validation(
           'Replacing attachment content requires expectedHash (contentHash from get_attachment)',
@@ -228,7 +243,6 @@ export class AttachmentsService {
           },
         );
       }
-      const body = this.bodyOf(input, 'update_attachment');
       if (body.mime && input.mime === undefined && body.mime !== current.mime)
         patch.mime = body.mime;
       try {

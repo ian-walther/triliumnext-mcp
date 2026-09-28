@@ -155,6 +155,72 @@ describe('binary content over the wire', () => {
     expect(harness.audit.at(-1)).toMatchObject({ tool: 'create_note', code: 'INVALID_ARGUMENTS' });
   });
 
+  it('R12: accepts data: URIs and raw base64 on all four binary tools, rejects junk (no mutation)', async () => {
+    harness = createHarness();
+    const client = await connect(harness);
+    const uri = 'data:image/png;base64,' + PNG.toString('base64');
+    const created = await client.callTool({
+      name: 'create_note',
+      arguments: { parentNoteId: 'projects', title: 'Uri', type: 'image', contentBase64: uri },
+    });
+    expect(created.isError).toBeFalsy();
+    const note = (
+      created.structuredContent as { note: { noteId: string; mime: string; contentHash: string } }
+    ).note;
+    expect(note.mime).toBe('image/png');
+    const patched = await client.callTool({
+      name: 'patch_note',
+      arguments: {
+        noteId: note.noteId,
+        expectedHash: note.contentHash,
+        operation: 'replace',
+        contentBase64: 'data:image/png;base64,' + Buffer.from('new').toString('base64'),
+      },
+    });
+    expect(patched.isError).toBeFalsy();
+    const att = await client.callTool({
+      name: 'create_attachment',
+      arguments: { noteId: 'plumb', title: 'p.png', mime: '', contentBase64: uri },
+    });
+    expect(att.isError).toBeFalsy();
+    const attachment = (
+      att.structuredContent as {
+        attachment: { attachmentId: string; mime: string; contentHash: string };
+      }
+    ).attachment;
+    expect(attachment.mime).toBe('image/png');
+    const upd = await client.callTool({
+      name: 'update_attachment',
+      arguments: {
+        attachmentId: attachment.attachmentId,
+        contentBase64: 'data:image/png;base64,' + Buffer.from('v2').toString('base64'),
+        expectedHash: attachment.contentHash,
+      },
+    });
+    expect(upd.isError).toBeFalsy();
+    const raw = await client.callTool({
+      name: 'create_attachment',
+      arguments: {
+        noteId: 'plumb',
+        title: 'raw.bin',
+        mime: 'application/octet-stream',
+        contentBase64: 'YWJj',
+      },
+    });
+    expect(raw.isError).toBeFalsy();
+
+    const before = harness.fake.calls.length;
+    for (const bad of ['data:text/plain,hello', '***', 'data:image/png;base64,@@@', 'YWJj%']) {
+      const res = await client.callTool({
+        name: 'create_attachment',
+        arguments: { noteId: 'plumb', title: 'bad', mime: 'text/plain', contentBase64: bad },
+      });
+      expect(res.isError).toBe(true);
+    }
+    expect(harness.fake.calls.slice(before).filter((c) => c.method !== 'GET')).toEqual([]);
+    expect(harness.audit.at(-1)).toMatchObject({ tool: 'create_attachment', ok: false });
+  });
+
   it('moves notes and records both parents in the audit trail', async () => {
     harness = createHarness();
     const client = await connect(harness);

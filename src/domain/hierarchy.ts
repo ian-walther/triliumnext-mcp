@@ -48,6 +48,10 @@ export interface MoveNoteResult {
 
 /** Upper bound on ancestors visited when checking for cycles; Trilium trees are far shallower. */
 export const MAX_ANCESTOR_WALK = 5000;
+/** Sibling placements read to resolve 'first'/'last' for an existing placement. */
+export const MAX_SIBLING_BRANCHES = 1000;
+/** Key of the process-wide lock shared by every operation that changes the tree (AUDIT R10). */
+export const HIERARCHY_LOCK = 'hierarchy';
 
 export function toBranchView(branch: EtapiBranch): BranchView {
   return {
@@ -71,7 +75,12 @@ export class HierarchyService {
   }
 
   move(input: MoveNoteInput): Promise<MoveNoteResult> {
-    return this.mutex.run(`note:${input.noteId}`, () => this.moveUnlocked(input));
+    // Tree changes are serialized process-wide so deletion's checks cannot be
+    // invalidated by a concurrent move (AUDIT R10); the per-note lock keeps the
+    // usual ordering with content writes (hierarchy first, then note).
+    return this.mutex.run(HIERARCHY_LOCK, () =>
+      this.mutex.run(`note:${input.noteId}`, () => this.moveUnlocked(input)),
+    );
   }
 
   private async moveUnlocked(input: MoveNoteInput): Promise<MoveNoteResult> {
@@ -116,7 +125,8 @@ export class HierarchyService {
     const parents = note.parentNoteIds ?? [];
     const alreadyThere = parents.includes(targetParentNoteId);
 
-    // Which placement leaves (move only).
+    // Which placement leaves (move only). A placement under the target itself is
+    // never a source: the destination branch must survive (AUDIT R9).
     let source: EtapiBranch | undefined;
     if (mode === 'move') {
       const branches = await this.parentBranches(note);
@@ -127,6 +137,7 @@ export class HierarchyService {
             `Placement of '${note.title}' under parent`,
             input.fromParentNoteId,
           );
+        if (source.parentNoteId === targetParentNoteId) source = undefined; // in-place edit
       } else {
         const candidates = branches.filter((b) => b.parentNoteId !== targetParentNoteId);
         if (candidates.length === 0 && alreadyThere) {
@@ -145,7 +156,9 @@ export class HierarchyService {
       }
     }
 
-    // Position and prefix for the new placement.
+    // Position and prefix for the new placement. On a fresh branch Trilium puts an
+    // omitted position last and 0 first; an existing placement is repositioned
+    // against its current siblings instead (AUDIT R13).
     const notePosition =
       input.position === 'first'
         ? 0
@@ -161,8 +174,12 @@ export class HierarchyService {
         (b) => b.parentNoteId === targetParentNoteId,
       )!;
       const patch: { notePosition?: number; prefix?: string } = {};
-      if (notePosition !== undefined && notePosition !== existing.notePosition)
+      if (input.position === 'first' || input.position === 'last') {
+        const wanted = await this.edgePosition(target, existing, input.position);
+        if (wanted !== existing.notePosition) patch.notePosition = wanted;
+      } else if (notePosition !== undefined && notePosition !== existing.notePosition) {
         patch.notePosition = notePosition;
+      }
       if (input.prefix !== undefined && (input.prefix ?? '') !== (existing.prefix ?? ''))
         patch.prefix = input.prefix ?? '';
       branch =
@@ -196,7 +213,13 @@ export class HierarchyService {
 
     let removedBranch: BranchView | undefined;
     if (source) {
-      // The new placement exists, so removing the old one can never delete the note.
+      // The destination placement exists and is a different branch, so removing
+      // the old one can never delete the note.
+      if (source.branchId === branch.branchId || source.parentNoteId === targetParentNoteId) {
+        throw new DomainError('INTERNAL', 'refusing to remove the destination placement', {
+          branchId: source.branchId,
+        });
+      }
       try {
         await client.deleteBranch(source.branchId);
         removedBranch = toBranchView(source);
@@ -220,6 +243,38 @@ export class HierarchyService {
       noop: false,
       warnings,
     };
+  }
+
+  /**
+   * notePosition that puts `existing` first or last among the target's current
+   * children: below the lowest sibling (never above 0 unless a sibling is) or
+   * 10 past the highest, matching Trilium's own spacing.
+   */
+  private async edgePosition(
+    target: EtapiNote,
+    existing: EtapiBranch,
+    edge: 'first' | 'last',
+  ): Promise<number> {
+    const ids = (target.childBranchIds ?? []).filter((id) => id !== existing.branchId);
+    if (ids.length > MAX_SIBLING_BRANCHES) {
+      throw DomainError.validation(
+        `'${target.title}' has more than ${MAX_SIBLING_BRANCHES} children; pass an explicit numeric position instead of '${edge}'`,
+      );
+    }
+    let siblings: EtapiBranch[];
+    try {
+      siblings = await Promise.all(ids.map((id) => this.client.getBranch(id)));
+    } catch (err) {
+      throw DomainError.from(err, `read sibling placements under ${target.noteId}`);
+    }
+    if (siblings.length === 0) return existing.notePosition;
+    const positions = siblings.map((b) => b.notePosition);
+    if (edge === 'last') {
+      const max = Math.max(...positions);
+      return existing.notePosition > max ? existing.notePosition : max + 10;
+    }
+    const min = Math.min(...positions);
+    return existing.notePosition < min ? existing.notePosition : Math.min(0, min - 10);
   }
 
   private async parentBranches(note: EtapiNote): Promise<EtapiBranch[]> {

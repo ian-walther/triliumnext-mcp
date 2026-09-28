@@ -1,5 +1,8 @@
 /** Live Trilium behaviour the v2.1 tools depend on: branches, soft delete, attachments, binary notes. */
 import { beforeAll, describe, expect, it } from 'vitest';
+import { IdempotencyStore } from '../../src/domain/idempotency.js';
+import { createServices } from '../../src/domain/services.js';
+import { TriliumClient } from '../../src/etapi/client.js';
 import { EtapiError } from '../../src/etapi/errors.js';
 import { connectLive, unique, type LiveTrilium } from './helpers.js';
 
@@ -218,5 +221,155 @@ describe('attachments and binary notes on live Trilium', () => {
     expect((await live.services.notes.get({ noteId: pdf.note.noteId })).contentBase64).toBe(
       'JVBERi0xLjQK',
     );
+  });
+});
+
+describe('audit regressions R9–R13 on live Trilium', () => {
+  it('R9: a same-parent move with fromParentNoteId keeps the note and its child', async () => {
+    const p = await live.services.notes.create({
+      principal: 'itest',
+      parentNoteId: rootId,
+      title: 'R9P',
+      type: 'book',
+    });
+    const n = await live.services.notes.create({
+      principal: 'itest',
+      parentNoteId: p.note.noteId,
+      title: 'R9N',
+    });
+    const c = await live.services.notes.create({
+      principal: 'itest',
+      parentNoteId: n.note.noteId,
+      title: 'R9C',
+    });
+    const result = await live.services.hierarchy.move({
+      noteId: n.note.noteId,
+      targetParentNoteId: p.note.noteId,
+      fromParentNoteId: p.note.noteId,
+    });
+    expect(result.noop).toBe(true);
+    expect((await live.client.getNote(n.note.noteId)).parentNoteIds).toEqual([p.note.noteId]);
+    expect((await live.client.getNote(c.note.noteId)).parentNoteIds).toEqual([n.note.noteId]);
+  });
+
+  it('R10: a child created while a leaf delete is in flight is not silently deleted', async () => {
+    let release!: () => void;
+    let hit!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const hitPromise = new Promise<void>((r) => (hit = r));
+    const client = new TriliumClient({
+      baseUrl: live.url,
+      token: live.token,
+      timeoutMs: 20_000,
+      fetch: async (input, init) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (init?.method === 'DELETE' && /\/notes\/[^/]+$/.test(url)) {
+          hit();
+          await gate;
+        }
+        return fetch(input, init);
+      },
+    });
+    const services = createServices({
+      client,
+      limits: {
+        maxWriteContentBytes: 2_000_000,
+        defaultReadContentBytes: 256_000,
+        maxReadContentBytes: 4_000_000,
+        maxSearchLimit: 200,
+        maxChildren: 500,
+      },
+      idempotency: new IdempotencyStore(),
+    });
+    const race = await services.notes.create({
+      principal: 'itest',
+      parentNoteId: rootId,
+      title: 'Race',
+      type: 'book',
+    });
+    const deletion = services.deletion.deleteNote({
+      noteId: race.note.noteId,
+      expectedTitle: 'Race',
+      confirm: true,
+    });
+    await hitPromise;
+    let created: 'pending' | 'done' | 'failed' = 'pending';
+    const creation = services.notes
+      .create({ principal: 'itest', parentNoteId: race.note.noteId, title: 'Kid' })
+      .then(
+        () => (created = 'done'),
+        () => (created = 'failed'),
+      );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(created).toBe('pending');
+    release();
+    expect((await deletion).deleted).toBe(true);
+    await creation;
+    expect(created).toBe('failed');
+    const kids = await live.client.searchNotes({ search: "note.title = 'Kid'" });
+    expect(kids.results).toEqual([]);
+  });
+
+  it('R11: blank mime/role are refused and the attachment stays readable', async () => {
+    const owner = await live.services.notes.create({
+      principal: 'itest',
+      parentNoteId: rootId,
+      title: 'R11',
+    });
+    const att = await live.services.attachments.create({
+      noteId: owner.note.noteId,
+      title: 'r11.txt',
+      mime: 'text/plain',
+      content: 'ok',
+    });
+    for (const bad of [{ mime: '' }, { role: '   ' }]) {
+      await expect(
+        live.services.attachments.update({ attachmentId: att.attachment.attachmentId, ...bad }),
+      ).rejects.toMatchObject({ code: 'VALIDATION' });
+    }
+    const read = await live.services.attachments.get({
+      attachmentId: att.attachment.attachmentId,
+    });
+    expect(read.content).toBe('ok');
+    expect((await live.services.attachments.list(owner.note.noteId)).attachments).toHaveLength(1);
+  });
+
+  it("R13: position 'last' reorders an existing placement", async () => {
+    const p = await live.services.notes.create({
+      principal: 'itest',
+      parentNoteId: rootId,
+      title: 'R13P',
+      type: 'book',
+    });
+    const early = await live.services.notes.create({
+      principal: 'itest',
+      parentNoteId: p.note.noteId,
+      title: 'Early',
+    });
+    const late = await live.services.notes.create({
+      principal: 'itest',
+      parentNoteId: p.note.noteId,
+      title: 'Late',
+    });
+    const moved = await live.services.hierarchy.move({
+      noteId: early.note.noteId,
+      targetParentNoteId: p.note.noteId,
+      position: 'last',
+    });
+    expect(moved.noop).toBe(false);
+    expect((await live.client.getNote(p.note.noteId)).childNoteIds).toEqual([
+      late.note.noteId,
+      early.note.noteId,
+    ]);
+    const back = await live.services.hierarchy.move({
+      noteId: early.note.noteId,
+      targetParentNoteId: p.note.noteId,
+      position: 'first',
+    });
+    expect(back.noop).toBe(false);
+    expect((await live.client.getNote(p.note.noteId)).childNoteIds).toEqual([
+      early.note.noteId,
+      late.note.noteId,
+    ]);
   });
 });

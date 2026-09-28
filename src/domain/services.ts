@@ -18,7 +18,7 @@ import { AttachmentsService } from './attachments.js';
 import { decodeBinaryInput } from './binary.js';
 import { DeletionService } from './deletion.js';
 import { DomainError } from './errors.js';
-import { HierarchyService } from './hierarchy.js';
+import { HIERARCHY_LOCK, HierarchyService } from './hierarchy.js';
 import {
   fingerprintOf,
   IdempotencyKeyMismatch,
@@ -814,8 +814,12 @@ export class NotesService {
     input: CreateNoteInput & { parentNoteId: string; type: string; title: string },
     checkpoint?: (c: Checkpoint<CreateNoteResult>) => void,
   ): Promise<CreateNoteResult> {
+    // Hierarchy lock first (shared with move/delete/undelete/rename, AUDIT R10),
+    // then the per-(parent, title) key for the duplicate check.
     const key = `create:${input.parentNoteId}\u0000${input.title}`;
-    return this.mutex.run(key, () => this.createUnlocked(input, checkpoint));
+    return this.mutex.run(HIERARCHY_LOCK, () =>
+      this.mutex.run(key, () => this.createUnlocked(input, checkpoint)),
+    );
   }
 
   private async createUnlocked(
@@ -1133,7 +1137,13 @@ export class NotesService {
     };
   }
 
-  async updateMetadata(
+  updateMetadata(input: UpdateMetadataInput): Promise<{ note: NoteDetail; changed: string[] }> {
+    // Renames take the hierarchy lock so delete_note's expectedTitle check
+    // cannot be raced by a same-process rename (AUDIT R10).
+    return this.mutex.run(HIERARCHY_LOCK, () => this.updateMetadataUnlocked(input));
+  }
+
+  private async updateMetadataUnlocked(
     input: UpdateMetadataInput,
   ): Promise<{ note: NoteDetail; changed: string[] }> {
     const { client } = this.deps;
@@ -1627,6 +1637,6 @@ export function createServices(deps: ServiceDeps): Services {
   const attributes = new AttributesService(shared, notes);
   const hierarchy = new HierarchyService(deps.client, mutex);
   const attachments = new AttachmentsService(deps.client, deps.limits, mutex);
-  const deletion = new DeletionService(deps.client);
+  const deletion = new DeletionService(deps.client, mutex);
   return { search, notes, attributes, hierarchy, attachments, deletion };
 }
