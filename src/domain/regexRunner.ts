@@ -142,13 +142,20 @@ export function scanRegex(options: ScanOptions): Promise<ScanResult> {
 }
 
 /**
- * Expand a String.prototype.replace-style template ($&, $1, $<name>, $$, $\`, $')
- * against one match of `content`, emitting each literal run and token value
- * through `emit` as it is produced. Because nothing is joined here, an `emit`
- * that enforces a byte budget bounds the expansion before any large string is
- * materialized (AUDIT R3). Named captures are substituted only when they are
- * own properties of the group map, matching JavaScript, so `$<toString>` cannot
- * read inherited members (AUDIT R4).
+ * Expand a String.prototype.replace-style template against one match of
+ * `content`, emitting each literal run and token value through `emit` as it is
+ * produced. Nothing is joined here, so an `emit` that enforces a byte budget
+ * bounds the expansion before any large string exists (AUDIT R3).
+ *
+ * This is a hand-written, single-pass implementation of ECMAScript
+ * GetSubstitution: `$$`, `$&`, `$\``, `$'`, `$n`/`$nn` (with the two-digit
+ * fallback), and `$<name>`. Differences from the native algorithm are only
+ * these two deliberate ones:
+ * - named captures are substituted only for own properties of the group map,
+ *   because the map crossed a worker boundary and no longer has a null
+ *   prototype (AUDIT R4);
+ * - work is linear in the template length even for many unterminated `$<`
+ *   sequences, because the next `>` is located once and reused (AUDIT R7).
  */
 export function expandReplacementInto(
   template: string,
@@ -161,38 +168,75 @@ export function expandReplacementInto(
     emit(template);
     return;
   }
-  const re = /\$(\$|&|`|'|\d{1,2}|<([^>]*)>)/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(template)) !== null) {
-    if (m.index > last) emit(template.slice(last, m.index));
-    last = m.index + m[0].length;
-    const token = m[1]!;
-    const name = m[2];
-    if (token === '$') emit('$');
-    else if (token === '&') emit(match.captures[0] ?? '');
-    else if (token === '`') emit(content.slice(0, match.index));
-    else if (token === "'") emit(content.slice(match.index + match.length));
-    else if (token.startsWith('<')) {
-      // JavaScript keeps "$<name>" literal when the pattern has no named groups,
-      // and substitutes the empty string for an unknown or unmatched name otherwise.
-      const groups = match.groups;
-      if (groups === undefined || groups === null) emit(m[0]);
-      else emit(Object.hasOwn(groups, name ?? '') ? (groups[name ?? ''] ?? '') : '');
+  const captureCount = match.captures.length - 1;
+  const groups = match.groups ?? undefined;
+  const len = template.length;
+  let pos = 0;
+  let runStart = 0;
+  // Position of the next '>' at or after `gtFrom`; -1 means none anywhere later.
+  let gtFrom = 0;
+  let nextGt = template.indexOf('>');
+  const flush = (end: number) => {
+    if (end > runStart) emit(template.slice(runStart, end));
+  };
+  while (pos < len) {
+    const dollar = template.indexOf('$', pos);
+    if (dollar === -1 || dollar === len - 1) break;
+    const next = template.charCodeAt(dollar + 1);
+    let consumed = 2;
+    let value: string | undefined;
+    if (next === 0x24)
+      value = '$'; // $$
+    else if (next === 0x26)
+      value = match.captures[0] ?? ''; // $&
+    else if (next === 0x60)
+      value = content.slice(0, match.index); // $`
+    else if (next === 0x27)
+      value = content.slice(match.index + match.length); // $'
+    else if (next >= 0x30 && next <= 0x39) {
+      // $n or $nn: prefer two digits when that group exists, else one digit.
+      const d1 = next - 0x30;
+      const c2 = dollar + 2 < len ? template.charCodeAt(dollar + 2) : -1;
+      const twoDigit = c2 >= 0x30 && c2 <= 0x39;
+      let index = twoDigit ? d1 * 10 + (c2 - 0x30) : d1;
+      let digits = twoDigit ? 2 : 1;
+      if (twoDigit && index > captureCount) {
+        index = d1;
+        digits = 1;
+      }
+      consumed = 1 + digits;
+      if (index >= 1 && index <= captureCount) value = match.captures[index] ?? '';
+      else value = template.slice(dollar, dollar + consumed); // literal "$0", "$9", ...
+    } else if (next === 0x3c) {
+      // $<
+      if (groups === undefined) {
+        // No named groups: "$<" is literal and parsing continues right after it.
+        value = '$<';
+      } else {
+        if (nextGt !== -1 && nextGt < dollar + 2) {
+          if (gtFrom <= nextGt) {
+            nextGt = template.indexOf('>', dollar + 2);
+            gtFrom = dollar + 2;
+          }
+        }
+        if (nextGt === -1) value = '$<';
+        else {
+          const name = template.slice(dollar + 2, nextGt);
+          value = Object.hasOwn(groups, name) ? (groups[name] ?? '') : '';
+          consumed = nextGt + 1 - dollar;
+        }
+      }
     } else {
-      const n = Number(token);
-      if (n >= 1 && n < match.captures.length) emit(match.captures[n] ?? '');
-      else if (
-        token.length === 2 &&
-        Number(token[0]) >= 1 &&
-        Number(token[0]) < match.captures.length
-      ) {
-        // "$12" with fewer groups falls back to "$1" followed by "2", like replace().
-        emit((match.captures[Number(token[0])] ?? '') + token[1]);
-      } else emit(m[0]);
+      // "$" followed by anything else is a literal "$"; keep parsing at the next char.
+      value = '$';
+      consumed = 1;
     }
+    flush(dollar);
+    emit(value);
+    pos = dollar + consumed;
+    runStart = pos;
   }
-  if (last < template.length) emit(template.slice(last));
+  flush(len);
 }
 
 /** Convenience wrapper without a budget; the edit path uses expandReplacementInto. */

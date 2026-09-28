@@ -409,3 +409,141 @@ describe('R4 (pass 3) named captures never read inherited properties', () => {
     expect(res.editsApplied).toBe(1);
   });
 });
+
+describe('R7 / R4 (pass 4) replacement templates parse linearly and match native semantics', () => {
+  const tokens = [
+    '$$',
+    '$&',
+    '$`',
+    "$'",
+    '$1',
+    '$2',
+    '$0',
+    '$10',
+    '$12',
+    '$<x>',
+    '$<y>',
+    '$<',
+    '>',
+    'a',
+    '$',
+    '$<$&>',
+    '$<toString>',
+  ];
+  const patterns: Array<[RegExp, string]> = [
+    [/b/, 'abc'],
+    [/(b)/, 'abc'],
+    [/(?<x>b)/, 'abc'],
+    [/(b)(c)/, 'abcd'],
+    [/(?<x>b)(?<y>z)?/, 'abc'],
+  ];
+  const toMatch = (re: RegExp, input: string) => {
+    const m = re.exec(input)!;
+    return {
+      index: m.index,
+      length: m[0].length,
+      captures: Array.from(m),
+      groups: m.groups ? { ...m.groups } : null,
+    };
+  };
+  const expand = (re: RegExp, input: string, template: string) => {
+    const m = toMatch(re, input);
+    return (
+      input.slice(0, m.index) +
+      expandReplacement(template, m, input, false) +
+      input.slice(m.index + m.length)
+    );
+  };
+
+  it('agrees with String.prototype.replace on a seeded corpus of token combinations', () => {
+    let seed = 42;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let i = 0; i < 3000; i++) {
+      const n = 1 + Math.floor(rnd() * 5);
+      let t = '';
+      for (let j = 0; j < n; j++) t += tokens[Math.floor(rnd() * tokens.length)];
+      for (const [re, input] of patterns)
+        expect(expand(re, input, t), `${re.source} :: ${t}`).toBe(input.replace(re, t));
+    }
+  });
+
+  it('handles malformed named-capture syntax like JavaScript, with and without named groups', () => {
+    const cases = [
+      '$<$&>',
+      '$<$$>',
+      "$<$`$'>",
+      '$<$1>',
+      '$<a$<b>c',
+      '$<',
+      '$<x',
+      '$<x>$<',
+      '>$<x>',
+      '$<>',
+      '$<toString>$&',
+      '$$<x>',
+    ];
+    for (const t of cases) {
+      for (const [re, input] of patterns)
+        expect(expand(re, input, t), `${re.source} :: ${t}`).toBe(input.replace(re, t));
+    }
+    expect(expand(/b/, 'abc', '$<$&>')).toBe('a$<b>c');
+    expect(expand(/(?<x>b)/, 'abc', '$<$&>')).toBe('ac'); // unknown name "$&" with groups present → empty
+  });
+
+  it('does not rescan the suffix for each unterminated "$<" (linear time)', () => {
+    const big = '$<'.repeat(100_000); // the maximum the tool schema allows
+    const named = toMatch(/(?<x>b)/, 'abc');
+    const unnamed = toMatch(/b/, 'abc');
+    const time = (fn: () => string) => {
+      const t0 = performance.now();
+      const out = fn();
+      return { ms: performance.now() - t0, out };
+    };
+    const small = time(() => expandReplacement('$<'.repeat(10_000), named, 'abc', false));
+    const large = time(() => expandReplacement(big, named, 'abc', false));
+    expect(large.out).toBe('abc'.replace(/(?<x>b)/, big).slice(1, -1));
+    expect(time(() => expandReplacement(big, unnamed, 'abc', false)).out).toBe(
+      'abc'.replace(/b/, big).slice(1, -1),
+    );
+    // Generous bounds: the quadratic version took seconds; linear takes milliseconds.
+    expect(large.ms).toBeLessThan(500);
+    expect(large.ms).toBeLessThan(Math.max(50, small.ms * 40));
+  });
+
+  it('tool-level: stores native results for "$<$&>" and for the maximum unterminated template', async () => {
+    fake.addNote({
+      noteId: 'r4',
+      title: 'R4',
+      type: 'code',
+      mime: 'text/plain',
+      parentNoteId: 'home',
+      content: 'abc',
+    });
+    await services.notes.patch({
+      noteId: 'r4',
+      expectedHash: fake.blobId('r4'),
+      operation: 'edit',
+      edits: [{ find: 'b', replace: '$<$&>', regex: true }],
+    });
+    expect(fake.notes.get('r4')?.content).toBe('a$<b>c');
+    fake.addNote({
+      noteId: 'r7',
+      title: 'R7',
+      type: 'code',
+      mime: 'text/plain',
+      parentNoteId: 'home',
+      content: 'abc',
+    });
+    // 80 000 characters: below this fixture's 100 000-byte write limit (the helper test covers the schema maximum).
+    const big = '$<'.repeat(40_000);
+    const t0 = performance.now();
+    await services.notes.patch({
+      noteId: 'r7',
+      expectedHash: fake.blobId('r7'),
+      operation: 'edit',
+      edits: [{ find: '(?<x>b)', replace: big, regex: true }],
+    });
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(fake.notes.get('r7')?.content).toBe('abc'.replace(/(?<x>b)/, big));
+  });
+});
