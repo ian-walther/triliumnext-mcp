@@ -157,10 +157,18 @@ export const branchSchema = z.object({
   isExpanded: z.boolean(),
 });
 
+/**
+ * Linear-time shape check for base64 / data: URI input (AUDIT R15). The
+ * payload class excludes '=', and each '=' may only be followed by whitespace,
+ * so no two quantifiers can claim the same characters and a failing input
+ * backtracks once per position. Padding correctness is checked by the decoder.
+ */
+export const BASE64_INPUT_PATTERN = /^(?:data:[^,]{0,200},)?[A-Za-z0-9+/\s]*(?:=\s*){0,2}$/;
+
 export const base64Schema = z
   .string()
   .regex(
-    /^(data:[^,]{0,200},)?[A-Za-z0-9+/\s]*={0,2}\s*$/,
+    BASE64_INPUT_PATTERN,
     'contentBase64 must be standard base64, optionally as a data:<mime>;base64, URI',
   )
   .describe(

@@ -1,6 +1,6 @@
 {
   "name": "trilium-mcp",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Model Context Protocol server for TriliumNext Notes: stdio for local agents, authenticated Streamable HTTP for cloud agents.",
   "private": true,
   "type": "module",

@@ -27,12 +27,28 @@ export function decodeBinaryInput(input: string, maxBytes: number, where: string
     encoded = input.slice(dataUri[0].length);
   }
   encoded = encoded.replace(/\s+/g, '');
-  if (encoded === '') throw DomainError.validation(`${where}: binary content is empty`);
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
     throw DomainError.validation(`${where}: content is not valid base64`);
   }
+  // Padding must agree with the data length (AUDIT R16): 4k data characters take
+  // none, 4k+2 take '==', 4k+3 take '=' (or none, for unpadded input), and 4k+1
+  // is impossible. Node's decoder would silently accept anything else.
   const padding = encoded.endsWith('==') ? 2 : encoded.endsWith('=') ? 1 : 0;
-  const decodedLength = Math.floor((encoded.length * 3) / 4) - padding;
+  const dataLength = encoded.length - padding;
+  if (dataLength === 0) throw DomainError.validation(`${where}: binary content is empty`);
+  const remainder = dataLength % 4;
+  const validPadding =
+    remainder === 0
+      ? padding === 0
+      : remainder === 2
+        ? padding !== 1
+        : remainder === 3
+          ? padding !== 2
+          : false;
+  if (!validPadding) {
+    throw DomainError.validation(`${where}: content is not valid base64 (malformed padding)`);
+  }
+  const decodedLength = Math.floor((dataLength * 3) / 4);
   if (decodedLength > maxBytes) {
     throw new DomainError(
       'TOO_LARGE',
@@ -41,6 +57,10 @@ export function decodeBinaryInput(input: string, maxBytes: number, where: string
     );
   }
   const bytes = Buffer.from(encoded, 'base64');
+  // Defense in depth: the estimate above is exact for validated input.
+  if (bytes.length !== decodedLength || bytes.length > maxBytes) {
+    throw DomainError.validation(`${where}: content is not valid base64`);
+  }
   return mime !== undefined ? { bytes, mime } : { bytes };
 }
 

@@ -221,6 +221,112 @@ describe('binary content over the wire', () => {
     expect(harness.audit.at(-1)).toMatchObject({ tool: 'create_attachment', ok: false });
   });
 
+  it('R15/R16: adversarial base64 is rejected fast, without mutation, on all four tools', async () => {
+    harness = createHarness();
+    const client = await connect(harness);
+    const created = await client.callTool({
+      name: 'create_note',
+      arguments: {
+        parentNoteId: 'projects',
+        title: 'Bin',
+        type: 'file',
+        mime: 'application/octet-stream',
+        contentBase64: 'YWJj',
+      },
+    });
+    const note = (created.structuredContent as { note: { noteId: string; contentHash: string } })
+      .note;
+    const att = await client.callTool({
+      name: 'create_attachment',
+      arguments: {
+        noteId: note.noteId,
+        title: 'a.bin',
+        mime: 'application/octet-stream',
+        contentBase64: 'YWJj',
+      },
+    });
+    const attachment = (
+      att.structuredContent as { attachment: { attachmentId: string; contentHash: string } }
+    ).attachment;
+    const before = harness.fake.calls.length;
+    const revisionsBefore = harness.fake.revisions.length;
+    const slow = ' '.repeat(60_000) + '!';
+    const inputs = [
+      slow,
+      'data:image/png;base64,' + slow,
+      '=',
+      '==',
+      'AAAA==',
+      'data:application/pdf;base64,==',
+    ];
+    const calls = (bad: string) => [
+      {
+        name: 'create_note',
+        arguments: {
+          parentNoteId: 'projects',
+          title: 'X',
+          type: 'file',
+          mime: 'application/octet-stream',
+          contentBase64: bad,
+        },
+      },
+      {
+        name: 'patch_note',
+        arguments: {
+          noteId: note.noteId,
+          expectedHash: note.contentHash,
+          operation: 'replace',
+          contentBase64: bad,
+        },
+      },
+      {
+        name: 'create_attachment',
+        arguments: {
+          noteId: note.noteId,
+          title: 'y.bin',
+          mime: 'application/octet-stream',
+          contentBase64: bad,
+        },
+      },
+      {
+        name: 'update_attachment',
+        arguments: {
+          attachmentId: attachment.attachmentId,
+          contentBase64: bad,
+          expectedHash: attachment.contentHash,
+        },
+      },
+    ];
+    let maxGap = 0;
+    let last = performance.now();
+    const ticker = setInterval(() => {
+      const now = performance.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+    }, 5);
+    const started = performance.now();
+    try {
+      for (const bad of inputs)
+        for (const call of calls(bad)) {
+          const res = await client.callTool(call);
+          expect(res.isError).toBe(true);
+        }
+    } finally {
+      clearInterval(ticker);
+    }
+    expect(performance.now() - started).toBeLessThan(2000); // 24 rejections, was ~2 s each before
+    expect(maxGap).toBeLessThan(250);
+    expect(harness.fake.calls.slice(before).filter((c) => c.method !== 'GET')).toEqual([]);
+    expect(harness.fake.revisions.length).toBe(revisionsBefore);
+    expect(harness.fake.blobId(note.noteId)).toBe(note.contentHash);
+    expect(
+      (await client.callTool({ name: 'get_note', arguments: { noteId: note.noteId } }))
+        .structuredContent,
+    ).toMatchObject({
+      contentBase64: 'YWJj',
+    });
+  });
+
   it('moves notes and records both parents in the audit trail', async () => {
     harness = createHarness();
     const client = await connect(harness);
