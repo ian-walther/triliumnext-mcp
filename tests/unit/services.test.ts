@@ -232,7 +232,6 @@ describe('NotesService.create', () => {
       principal: 'p',
       title: 'Once',
       idempotencyKey: 'key-12345678',
-      ifTitleExists: 'create',
     });
     expect(again.idempotentReplay).toBe(true);
     expect(again.note.noteId).toBe(first.note.noteId);
@@ -375,14 +374,16 @@ describe('NotesService.patch', () => {
 });
 
 describe('applyEdit', () => {
-  it('handles literal, regex, all and occurrence', () => {
-    expect(applyEdit('a.b a.b', { find: 'a.b', replace: 'x', occurrence: 2 }, 'e')).toBe('a.b x');
-    expect(
+  it('handles literal, regex, all and occurrence', async () => {
+    await expect(
+      applyEdit('a.b a.b', { find: 'a.b', replace: 'x', occurrence: 2 }, 'e'),
+    ).resolves.toBe('a.b x');
+    await expect(
       applyEdit('a1 a2', { find: 'a(\\d)', replace: 'b$1', regex: true, all: true }, 'e'),
-    ).toBe('b1 b2');
-    expect(() => applyEdit('aaa', { find: 'a*', replace: 'x', regex: true }, 'e')).toThrow(
-      DomainError,
-    );
+    ).resolves.toBe('b1 b2');
+    await expect(
+      applyEdit('aaa', { find: 'a*', replace: 'x', regex: true }, 'e'),
+    ).rejects.toBeInstanceOf(DomainError);
   });
 });
 

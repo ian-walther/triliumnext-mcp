@@ -118,7 +118,7 @@ describe('HTTP transport (auth none, loopback)', () => {
   });
 
   it('exposes a health endpoint without note content', async () => {
-    harness = createHarness();
+    harness = createHarness({}, { healthCacheMs: 0 });
     const res = await harness.fetch('http://127.0.0.1:3939/healthz');
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ status: 'ok', trilium: { reachable: true } });

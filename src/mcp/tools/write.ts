@@ -1,7 +1,7 @@
 /** Write tools (scope trilium.write). All content writes are hash-protected. */
 import * as z from 'zod/v4';
 import type { Services } from '../../domain/services.js';
-import { ok } from '../results.js';
+import { ok, withAudit } from '../results.js';
 import {
   attributeInputSchema,
   attributeOpResultSchema,
@@ -103,8 +103,13 @@ export function writeTools(services: Services): AnyToolDefinition[] {
         },
       },
       noteIds: (args) => [args.parentNoteId ?? 'root'],
-      handler: async (args, ctx) =>
-        ok(await services.notes.create({ ...args, principal: ctx.principal.id })),
+      handler: async (args, ctx) => {
+        const created = await services.notes.create({ ...args, principal: ctx.principal.id });
+        return withAudit(ok(created), {
+          noteIds: [args.parentNoteId ?? 'root', created.note.noteId],
+          ...(created.attributeResults.some((r) => !r.ok) ? { code: 'PARTIAL' } : {}),
+        });
+      },
     }),
     defineTool({
       name: 'patch_note',
@@ -222,7 +227,12 @@ export function writeTools(services: Services): AnyToolDefinition[] {
       noteIds: (args) => [args.noteId],
       handler: async (args) => {
         const result = await services.attributes.manage(args.noteId, args.operations);
-        return ok({ ...result, attributes: result.note.attributes });
+        const failed = result.results.filter((r) => !r.ok).length;
+        return withAudit(ok({ ...result, attributes: result.note.attributes }), {
+          ...(failed > 0
+            ? { code: failed === result.results.length ? 'ALL_FAILED' : 'PARTIAL' }
+            : {}),
+        });
       },
     }),
   ];

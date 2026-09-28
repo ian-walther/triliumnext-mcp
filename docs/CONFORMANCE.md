@@ -2,8 +2,8 @@
 
 `npm run conformance` builds the server, starts the HTTP entry point on
 loopback against an in-memory fake Trilium, and runs the official
-`@modelcontextprotocol/conformance` suite (0.2.0-alpha line, the only release
-that knows the 2026-07-28 revision) with `--requirements` for each revision.
+`@modelcontextprotocol/conformance` suite (pinned to 0.2.0-alpha.11, the
+line that knows the 2026-07-28 revision) with `--requirements` for each revision.
 `conformance-baseline.yml` lists scenarios that cannot pass against this server
 and says why; any other failure fails the run.
 

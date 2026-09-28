@@ -9,3 +9,5 @@ results/
 !.env.example
 .DS_Store
 docs/HANDOFF.md
+AUDIT.md
+AUDIT-RESPONSE.md

@@ -1,9 +1,12 @@
 /** Shared wiring for protocol tests: fake Trilium + app context + HTTP transport. */
-import type { OAuthTokenVerifier } from '@modelcontextprotocol/server';
 import { createAppContext, type AppContext } from '../../src/app.js';
 import { loadConfig } from '../../src/config.js';
-import { silentLogger, type AuditEvent } from '../../src/logging/logger.js';
-import { createHttpTransport, type HttpTransport } from '../../src/transport/http.js';
+import { silentLogger, type AuditEvent, type Logger } from '../../src/logging/logger.js';
+import {
+  createHttpTransport,
+  type HttpTransport,
+  type HttpTransportOptions,
+} from '../../src/transport/http.js';
 import { FakeTrilium } from './fakeTrilium.js';
 
 export interface Harness {
@@ -36,7 +39,7 @@ export function seed(fake: FakeTrilium): void {
 
 export function createHarness(
   env: NodeJS.ProcessEnv = {},
-  options: { verifier?: OAuthTokenVerifier } = {},
+  options: HttpTransportOptions & { logger?: Logger } = {},
 ): Harness {
   const fake = new FakeTrilium({ token: 'tok' });
   seed(fake);
@@ -50,7 +53,11 @@ export function createHarness(
     { version: '2.0.0-test' },
   );
   const audit: AuditEvent[] = [];
-  const ctx = createAppContext({ config, fetch: fake.fetch, logger: silentLogger });
+  const ctx = createAppContext({
+    config,
+    fetch: fake.fetch,
+    logger: options.logger ?? silentLogger,
+  });
   ctx.audit = { record: (e) => void audit.push(e) };
   const transport = createHttpTransport(ctx, options);
   const fetchFn = (input: string | URL, init?: RequestInit) => {

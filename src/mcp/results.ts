@@ -7,6 +7,25 @@
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import { DomainError } from '../domain/errors.js';
 
+export interface AuditMeta {
+  /** Outcome code for the audit record when the call succeeded only partially. */
+  code?: string;
+  /** Note ids the call actually touched or produced (overrides the input-derived list). */
+  noteIds?: string[];
+}
+
+const auditMetaByResult = new WeakMap<CallToolResult, AuditMeta>();
+
+/** Attach audit facts a handler learns while running (created ids, partial failure). */
+export function withAudit(result: CallToolResult, meta: AuditMeta): CallToolResult {
+  auditMetaByResult.set(result, meta);
+  return result;
+}
+
+export function auditMetaOf(result: CallToolResult): AuditMeta | undefined {
+  return auditMetaByResult.get(result);
+}
+
 export interface ToolErrorPayload {
   error: { code: string; message: string; details?: Record<string, unknown> };
 }

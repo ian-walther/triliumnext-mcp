@@ -15,7 +15,15 @@ import {
   type ContentFormat,
 } from './content.js';
 import { DomainError } from './errors.js';
-import type { IdempotencyStore } from './idempotency.js';
+import { fingerprintOf, IdempotencyKeyMismatch, type IdempotencyStore } from './idempotency.js';
+import { KeyedMutex } from './keyedMutex.js';
+import {
+  compilePattern,
+  escapeRegex,
+  expandReplacement,
+  scanRegex,
+  type RegexMatch,
+} from './regexRunner.js';
 import {
   toAttributeView,
   toNoteDetail,
@@ -38,7 +46,19 @@ export interface ServiceDeps {
   client: TriliumClient;
   limits: ServiceLimits;
   idempotency: IdempotencyStore;
+  /** Serializes mutations per note / per create key within this process. */
+  mutex?: KeyedMutex;
+  /** Wall-clock budget for one caller-supplied regex scan. */
+  regexTimeoutMs?: number;
+  /** Override for ASCENDING_WINDOW (tests). */
+  ascendingWindow?: number;
 }
+
+/** Deepest page offset a cursor may address; bounds how much upstream work one call can demand. */
+export const MAX_CURSOR_OFFSET = 10_000;
+/** Longest matched text returned by a find; longer matches are cut and flagged. */
+export const MAX_MATCH_CHARS = 500;
+const CONTEXT_CHARS = 80;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -52,16 +72,27 @@ async function fetchNote(client: TriliumClient, noteId: string): Promise<EtapiNo
   }
 }
 
+/**
+ * Fetch several notes. Vanished notes (404) are reported in `missing`; any other
+ * failure (timeout, outage, auth) is raised, because silently dropping a child
+ * would make a partial hierarchy look complete.
+ */
 async function fetchNotesById(
   client: TriliumClient,
   ids: string[],
-): Promise<Map<string, EtapiNote>> {
-  const out = new Map<string, EtapiNote>();
+  context: string,
+): Promise<{ notes: Map<string, EtapiNote>; missing: string[] }> {
+  const notes = new Map<string, EtapiNote>();
+  const missing: string[] = [];
   const results = await Promise.allSettled(ids.map((id) => client.getNote(id)));
+  let failure: unknown;
   results.forEach((r, i) => {
-    if (r.status === 'fulfilled') out.set(ids[i]!, r.value);
+    if (r.status === 'fulfilled') notes.set(ids[i]!, r.value);
+    else if (r.reason instanceof EtapiError && r.reason.isNotFound) missing.push(ids[i]!);
+    else failure ??= r.reason;
   });
-  return out;
+  if (failure !== undefined) throw DomainError.from(failure, context);
+  return { notes, missing };
 }
 
 function encodeCursor(offset: number): string {
@@ -71,9 +102,18 @@ function encodeCursor(offset: number): string {
 function decodeCursor(cursor: string | undefined): number {
   if (!cursor) return 0;
   const decoded = Buffer.from(cursor, 'base64url').toString('utf8');
-  const match = /^o:(\d+)$/.exec(decoded);
+  const match = /^o:(\d{1,7})$/.exec(decoded);
   if (!match) throw DomainError.validation('Invalid cursor');
-  return Number(match[1]);
+  const offset = Number(match[1]);
+  if (!Number.isSafeInteger(offset) || offset > MAX_CURSOR_OFFSET) {
+    throw DomainError.validation(
+      `Cursor offset exceeds the maximum of ${MAX_CURSOR_OFFSET}; narrow the search instead`,
+      {
+        maxOffset: MAX_CURSOR_OFFSET,
+      },
+    );
+  }
+  return offset;
 }
 
 export interface Page<T> {
@@ -81,6 +121,8 @@ export interface Page<T> {
   nextCursor?: string;
   /** Number of items known to exist (equals items when the whole result fit). */
   total: number;
+  /** True when more items exist than pagination can reach (see search ordering limits). */
+  truncated?: boolean;
 }
 
 function paginate<T>(all: T[], offset: number, limit: number): Page<T> {
@@ -154,9 +196,11 @@ export class SearchService {
     // ignored) and an `orderBy` clause inside the search string is not applied.
     // Ascending order is therefore computed here over a bounded window.
     const ascending = input.orderBy !== undefined && (input.orderDirection ?? 'asc') === 'asc';
-    const fetchLimit = ascending
-      ? Math.max(offset + limit + 1, ASCENDING_WINDOW)
-      : offset + limit + 1;
+    // Ascending order reverses a fixed window of ASCENDING_WINDOW results. The window
+    // never grows with the offset, so pages are stable; pages beyond it are reported
+    // as truncated rather than approximated.
+    const window = this.deps.ascendingWindow ?? ASCENDING_WINDOW;
+    const fetchLimit = ascending ? window + 1 : offset + limit + 1;
     const params: EtapiSearchParams = {
       search: query,
       fastSearch,
@@ -172,11 +216,18 @@ export class SearchService {
     try {
       response = await client.searchNotes(params);
     } catch (err) {
-      throw DomainError.from(err, `search '${query}'`);
+      // The query text is caller data; keep it out of error messages and logs.
+      throw DomainError.from(err, 'search');
     }
-    let all = (response.results ?? []).map(toNoteSummary);
-    if (ascending) all = all.reverse();
-    const page = paginate(all, offset, limit);
+    const fetched = (response.results ?? []).map(toNoteSummary);
+    if (ascending) {
+      const beyondWindow = fetched.length > window;
+      const inWindow = fetched.slice(0, window).reverse();
+      const page = paginate(inWindow, offset, limit);
+      if (beyondWindow && page.nextCursor === undefined) page.truncated = true;
+      return { ...page, query };
+    }
+    const page = paginate(fetched, offset, limit);
     return { ...page, query };
   }
 
@@ -244,7 +295,7 @@ export class SearchService {
           })
         ).results ?? [];
     } catch (err) {
-      throw DomainError.from(err, `resolve '${title}'`);
+      throw DomainError.from(err, 'resolve title');
     }
     const ranked = rankByTitle(results, title).map(toNoteSummary);
     if (ranked.length === 0) {
@@ -294,7 +345,7 @@ export class SearchService {
         const res = await this.deps.client
           .searchNotes({ search: query, fastSearch: false, includeArchivedNotes: true, limit: 50 })
           .catch((err: unknown) => {
-            throw DomainError.from(err, `resolve path segment '${segment}'`);
+            throw DomainError.from(err, `resolve path segment ${i + 1}`);
           });
         next.push(...(res.results ?? []).map(toNoteSummary));
       }
@@ -371,7 +422,12 @@ export interface GetNoteInput {
 
 export interface ContentMatch {
   index: number;
+  /** Length of the full match in the content. */
+  length: number;
+  /** The matched text, cut to MAX_MATCH_CHARS when longer. */
   match: string;
+  matchTruncated?: boolean;
+  /** Up to 80 characters before and after the (cut) match. */
   context: string;
 }
 
@@ -400,6 +456,8 @@ export interface NoteContextInput {
 export interface ChildEntry extends NoteSummary {
   contentPreview?: string;
   contentTruncated?: boolean;
+  /** Present when a preview was requested but could not be read (best-effort data). */
+  previewOmittedReason?: string;
 }
 
 export interface NoteContextResult extends GetNoteResult {
@@ -407,6 +465,8 @@ export interface NoteContextResult extends GetNoteResult {
   children: ChildEntry[];
   childrenTruncated: boolean;
   totalChildren: number;
+  /** Child or parent ids listed by Trilium that no longer resolve to a note. */
+  unavailableNoteIds: string[];
 }
 
 export interface ListChildrenInput {
@@ -496,7 +556,11 @@ export interface UpdateMetadataInput {
 }
 
 export class NotesService {
-  constructor(private readonly deps: ServiceDeps) {}
+  private readonly mutex: KeyedMutex;
+
+  constructor(private readonly deps: ServiceDeps) {
+    this.mutex = deps.mutex ?? new KeyedMutex();
+  }
 
   async get(input: GetNoteInput): Promise<GetNoteResult> {
     const { client, limits } = this.deps;
@@ -512,28 +576,31 @@ export class NotesService {
       result.contentOmittedReason = `Binary '${raw.type}' content is not returned; use Trilium directly for attachments`;
       return result;
     }
-    let content: string;
-    try {
-      content = await client.getNoteContent(input.noteId);
-    } catch (err) {
-      throw DomainError.from(err, `get content of ${input.noteId}`);
-    }
-    const format = input.format ?? 'raw';
-    const rendered = format === 'plain' && raw.type === 'text' ? htmlToPlainText(content) : content;
-    if (input.find) {
-      const found = findInContent(rendered, input.find);
-      result.matches = found.matches;
-      result.totalMatches = found.total;
-    }
     const maxBytes = Math.min(
       input.maxContentBytes ?? limits.defaultReadContentBytes,
       limits.maxReadContentBytes,
     );
-    const truncated = truncateContent(rendered, maxBytes);
-    result.content = truncated.content;
+    let bounded;
+    try {
+      bounded = await client.readNoteContent(input.noteId, maxBytes);
+    } catch (err) {
+      throw DomainError.from(err, `get content of ${input.noteId}`);
+    }
+    const format = input.format ?? 'raw';
+    const rendered =
+      format === 'plain' && raw.type === 'text'
+        ? htmlToPlainText(bounded.content)
+        : bounded.content;
+    if (input.find) {
+      // The scan covers the returned window only; raise maxContentBytes to search further.
+      const found = await findInContent(rendered, input.find, this.deps.regexTimeoutMs);
+      result.matches = found.matches;
+      result.totalMatches = found.total;
+    }
+    result.content = rendered;
     result.contentFormat = format;
-    result.contentTruncated = truncated.truncated;
-    result.contentBytes = truncated.totalBytes;
+    result.contentTruncated = bounded.truncated;
+    if (bounded.totalBytes !== undefined) result.contentBytes = bounded.totalBytes;
     return result;
   }
 
@@ -547,34 +614,40 @@ export class NotesService {
     });
     const childLimit = Math.min(input.childrenLimit ?? 50, limits.maxChildren);
     const childIds = base.note.childNoteIds;
-    const [childMap, parentMap] = await Promise.all([
-      fetchNotesById(client, childIds.slice(0, childLimit)),
+    const wantedChildren = childIds.slice(0, childLimit);
+    const [childFetch, parentFetch] = await Promise.all([
+      fetchNotesById(client, wantedChildren, `children of ${input.noteId}`),
       input.includeParents === false
-        ? Promise.resolve(new Map<string, EtapiNote>())
-        : fetchNotesById(client, base.note.parentNoteIds),
+        ? Promise.resolve({ notes: new Map<string, EtapiNote>(), missing: [] as string[] })
+        : fetchNotesById(client, base.note.parentNoteIds, `parents of ${input.noteId}`),
     ]);
     const children: ChildEntry[] = [];
-    for (const id of childIds.slice(0, childLimit)) {
-      const child = childMap.get(id);
+    for (const id of wantedChildren) {
+      const child = childFetch.notes.get(id);
       if (!child) continue;
       const entry: ChildEntry = toNoteSummary(child);
-      if (input.includeChildContent && !child.isProtected && !BINARY_TYPES.has(child.type)) {
-        try {
-          const text = await client.getNoteContent(id);
-          const preview = truncateContent(
-            child.type === 'text' ? htmlToPlainText(text) : text,
-            input.childContentBytes ?? 2048,
-          );
-          entry.contentPreview = preview.content;
-          entry.contentTruncated = preview.truncated;
-        } catch {
-          /* previews are best-effort */
+      if (input.includeChildContent) {
+        if (child.isProtected) entry.previewOmittedReason = 'protected';
+        else if (BINARY_TYPES.has(child.type)) entry.previewOmittedReason = `binary ${child.type}`;
+        else {
+          try {
+            const previewBytes = input.childContentBytes ?? 2048;
+            const text = await client.readNoteContent(id, previewBytes * 4);
+            const preview = truncateContent(
+              child.type === 'text' ? htmlToPlainText(text.content) : text.content,
+              previewBytes,
+            );
+            entry.contentPreview = preview.content;
+            entry.contentTruncated = preview.truncated || text.truncated;
+          } catch (err) {
+            entry.previewOmittedReason = DomainError.from(err).code;
+          }
         }
       }
       children.push(entry);
     }
     const parents = base.note.parentNoteIds
-      .map((id) => parentMap.get(id))
+      .map((id) => parentFetch.notes.get(id))
       .filter((n): n is EtapiNote => Boolean(n))
       .map(toNoteSummary);
     return {
@@ -583,6 +656,7 @@ export class NotesService {
       children,
       childrenTruncated: childIds.length > childLimit,
       totalChildren: childIds.length,
+      unavailableNoteIds: [...childFetch.missing, ...parentFetch.missing],
     };
   }
 
@@ -625,7 +699,7 @@ export class NotesService {
   }
 
   async create(input: CreateNoteInput): Promise<CreateNoteResult> {
-    const { client, limits, idempotency } = this.deps;
+    const { client, idempotency } = this.deps;
     const parentNoteId = input.parentNoteId ?? 'root';
     const type = input.type ?? 'text';
     const title = input.title.trim();
@@ -644,22 +718,81 @@ export class NotesService {
         "Code notes require a mime type, e.g. 'text/x-python' or 'text/plain'",
       );
     }
-    const warnings: string[] = [];
+    const request = { ...input, parentNoteId, type, title };
 
-    if (input.idempotencyKey) {
-      const replay = idempotency.get(input.principal, input.idempotencyKey);
-      if (replay) {
-        const note = await fetchNote(client, replay.noteId);
-        return {
-          note: toNoteDetail(note),
-          branchId: note.parentBranchIds[0] ?? '',
-          created: false,
-          attributeResults: [],
-          warnings,
-          idempotentReplay: true,
-        };
-      }
+    if (!input.idempotencyKey) return this.createSerialized(request);
+
+    // Same key + same payload → one upstream create, every caller gets the same note.
+    // Same key + different payload → rejected. Failures after the upstream create
+    // still record the note so a retry does not create a second one.
+    const fingerprint = fingerprintOf({
+      parentNoteId,
+      title,
+      type,
+      mime: input.mime ?? null,
+      content: input.content ?? '',
+      contentFormat: input.contentFormat ?? 'auto',
+      attributes: input.attributes ?? [],
+      position: input.position ?? 'last',
+      ifTitleExists: input.ifTitleExists ?? 'error',
+    });
+    let firstResult: CreateNoteResult | undefined;
+    let outcome;
+    try {
+      outcome = await idempotency.execute(
+        input.principal,
+        input.idempotencyKey,
+        fingerprint,
+        async (record) => {
+          firstResult = await this.createSerialized(request, record);
+          return { noteId: firstResult.note.noteId, contentHash: firstResult.note.contentHash };
+        },
+      );
+    } catch (err) {
+      if (err instanceof IdempotencyKeyMismatch)
+        throw DomainError.validation(err.message, { idempotencyKey: input.idempotencyKey });
+      throw err;
     }
+    if (!outcome.replayed && firstResult) return firstResult;
+    let note: EtapiNote;
+    try {
+      note = await client.getNote(outcome.record.noteId);
+    } catch (err) {
+      if (err instanceof EtapiError && err.isNotFound) {
+        throw new DomainError(
+          'NOT_FOUND',
+          `The note created earlier under idempotencyKey '${input.idempotencyKey}' no longer exists; use a new key to create another`,
+          { noteId: outcome.record.noteId },
+        );
+      }
+      throw DomainError.from(err, 'idempotent replay');
+    }
+    return {
+      note: toNoteDetail(note),
+      branchId: note.parentBranchIds[0] ?? '',
+      created: false,
+      attributeResults: [],
+      warnings: [],
+      idempotentReplay: true,
+    };
+  }
+
+  /** Creates with the duplicate-title check serialized per (parent, title) within this process. */
+  private createSerialized(
+    input: CreateNoteInput & { parentNoteId: string; type: string; title: string },
+    record?: (partial: { noteId: string; contentHash: string }) => void,
+  ): Promise<CreateNoteResult> {
+    const key = `create:${input.parentNoteId}\u0000${input.title}`;
+    return this.mutex.run(key, () => this.createUnlocked(input, record));
+  }
+
+  private async createUnlocked(
+    input: CreateNoteInput & { parentNoteId: string; type: string; title: string },
+    record?: (partial: { noteId: string; contentHash: string }) => void,
+  ): Promise<CreateNoteResult> {
+    const { client, limits } = this.deps;
+    const { parentNoteId, type, title } = input;
+    const warnings: string[] = [];
 
     const parent = await fetchNote(client, parentNoteId);
     const ifTitleExists = input.ifTitleExists ?? 'error';
@@ -678,6 +811,7 @@ export class NotesService {
       if (existing.length > 0) {
         if (ifTitleExists === 'return_existing') {
           const first = existing[0]!;
+          record?.({ noteId: first.noteId, contentHash: first.blobId });
           return {
             note: toNoteDetail(first),
             branchId: first.parentBranchIds[0] ?? '',
@@ -729,6 +863,8 @@ export class NotesService {
     } catch (err) {
       throw DomainError.from(err, 'create note');
     }
+    // The note exists from here on; make sure a retry finds it even if the rest fails.
+    record?.({ noteId: createdNote.noteId, contentHash: createdNote.blobId });
 
     const attributeResults: AttributeOpResult[] = [];
     for (const def of attributeDefs) {
@@ -737,11 +873,6 @@ export class NotesService {
     const finalNote = attributeDefs.length
       ? await fetchNote(client, createdNote.noteId)
       : createdNote;
-    if (input.idempotencyKey)
-      idempotency.set(input.principal, input.idempotencyKey, {
-        noteId: finalNote.noteId,
-        contentHash: finalNote.blobId,
-      });
     return {
       note: toNoteDetail(finalNote),
       branchId,
@@ -753,7 +884,17 @@ export class NotesService {
     };
   }
 
-  async patch(input: PatchNoteInput): Promise<PatchNoteResult> {
+  /**
+   * Hash-protected content write. The read-validate-write sequence runs under a
+   * per-note lock so two callers holding the same hash cannot both succeed in
+   * this process. ETAPI has no conditional PUT, so writers outside this process
+   * are only caught by the hash re-check immediately before the write.
+   */
+  patch(input: PatchNoteInput): Promise<PatchNoteResult> {
+    return this.mutex.run(`note:${input.noteId}`, () => this.patchUnlocked(input));
+  }
+
+  private async patchUnlocked(input: PatchNoteInput): Promise<PatchNoteResult> {
     const { client, limits } = this.deps;
     const current = await fetchNote(client, input.noteId);
     if (current.isProtected)
@@ -770,7 +911,14 @@ export class NotesService {
 
     let existing: string;
     try {
-      existing = await client.getNoteContent(input.noteId);
+      const bounded = await client.readNoteContent(input.noteId, limits.maxWriteContentBytes);
+      if (bounded.truncated) {
+        throw new DomainError(
+          'TOO_LARGE',
+          `Note '${input.noteId}' is larger than the write limit of ${limits.maxWriteContentBytes} bytes and cannot be patched through this server`,
+        );
+      }
+      existing = bounded.content;
     } catch (err) {
       throw DomainError.from(err, `get content of ${input.noteId}`);
     }
@@ -778,7 +926,7 @@ export class NotesService {
     const warnings: string[] = [];
     let next: string;
     let editsApplied = 0;
-    const separator = input.separator ?? (current.type === 'text' ? '\n' : '\n');
+    const separator = input.separator ?? '\n';
     switch (input.operation) {
       case 'replace': {
         const normalized = normalizeContentForWrite({
@@ -811,10 +959,10 @@ export class NotesService {
         if (!input.edits?.length)
           throw DomainError.validation("operation 'edit' requires a non-empty edits array");
         next = existing;
-        input.edits.forEach((edit, i) => {
-          next = applyEdit(next, edit, `edits[${i}]`);
+        for (const [i, edit] of input.edits.entries()) {
+          next = await applyEdit(next, edit, `edits[${i}]`, this.deps.regexTimeoutMs);
           editsApplied += 1;
-        });
+        }
         break;
       }
       default:
@@ -834,11 +982,12 @@ export class NotesService {
 
     let revisionCreated = false;
     if (input.createRevision !== false) {
+      // The revision is the recovery path for this non-atomic write; without it, do not write.
       try {
         await client.createRevision(input.noteId, 'trilium-mcp patch_note');
         revisionCreated = true;
       } catch (err) {
-        warnings.push(`revision not created: ${(err as Error).message}`);
+        throw DomainError.from(err, `create revision of ${input.noteId} (content left unchanged)`);
       }
     }
     try {
@@ -985,25 +1134,34 @@ export class NotesService {
     const { client } = this.deps;
     this.builtInTemplates ??= (async () => {
       const map = new Map<string, string>();
+      let folder: EtapiNote;
       try {
-        const folder = await client.getNote('_templates');
-        const children = await fetchNotesById(client, folder.childNoteIds ?? []);
-        for (const note of children.values()) {
-          map.set(note.title.toLowerCase(), note.noteId);
-          // `_template_geo_map` → "geo map"; also accept the id suffix with underscores.
-          map.set(
-            note.noteId
-              .replace(/^_template_/, '')
-              .replace(/_/g, ' ')
-              .toLowerCase(),
-            note.noteId,
-          );
-        }
-        if (!map.has('board') && map.has('kanban board'))
-          map.set('board', map.get('kanban board')!);
-      } catch {
-        /* older Trilium without the folder: no built-ins */
+        folder = await client.getNote('_templates');
+      } catch (err) {
+        if (err instanceof EtapiError && err.isNotFound) return map; // older Trilium: no built-ins
+        this.builtInTemplates = undefined; // transient failure: retry on the next call
+        throw DomainError.from(err, 'load built-in templates');
       }
+      const children = await fetchNotesById(
+        client,
+        folder.childNoteIds ?? [],
+        'load built-in templates',
+      ).catch((err: unknown) => {
+        this.builtInTemplates = undefined;
+        throw err;
+      });
+      for (const note of children.notes.values()) {
+        map.set(note.title.toLowerCase(), note.noteId);
+        // `_template_geo_map` → "geo map"; also accept the id suffix with underscores.
+        map.set(
+          note.noteId
+            .replace(/^_template_/, '')
+            .replace(/_/g, ' ')
+            .toLowerCase(),
+          note.noteId,
+        );
+      }
+      if (!map.has('board') && map.has('kanban board')) map.set('board', map.get('kanban board')!);
       return map;
     })();
     return this.builtInTemplates.then((map) => map.get(title.trim().toLowerCase()));
@@ -1050,40 +1208,40 @@ function assertHash(note: EtapiNote, expectedHash: string): void {
   }
 }
 
-const SAFE_FLAGS = /^[gimsuy]*$/;
-
-export function applyEdit(content: string, edit: TextEdit, where: string): string {
+export async function applyEdit(
+  content: string,
+  edit: TextEdit,
+  where: string,
+  timeoutMs?: number,
+): Promise<string> {
   if (edit.find === '') throw DomainError.validation(`${where}: find must not be empty`);
-  const flags = edit.flags ?? '';
-  if (!SAFE_FLAGS.test(flags))
-    throw DomainError.validation(`${where}: invalid regex flags '${flags}'`);
-  let re: RegExp;
-  try {
-    const source = edit.regex ? edit.find : edit.find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    re = new RegExp(source, flags.replace('g', '') + 'g');
-  } catch (err) {
-    throw DomainError.validation(`${where}: invalid pattern: ${(err as Error).message}`);
-  }
-  const matches: Array<{ index: number; length: number; match: RegExpExecArray }> = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    if (m[0].length === 0)
-      throw DomainError.validation(`${where}: pattern matches an empty string`);
-    matches.push({ index: m.index, length: m[0].length, match: m });
-    if (matches.length > 10_000) throw DomainError.validation(`${where}: too many matches`);
-  }
+  const literal = !edit.regex;
+  const pattern = compilePattern(
+    literal ? escapeRegex(edit.find) : edit.find,
+    edit.flags ?? '',
+    where,
+  );
+  const scan = await scanRegex({
+    content,
+    source: pattern.source,
+    flags: pattern.flags,
+    maxMatches: 10_001,
+    maxTotal: 10_001,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  });
+  if (scan.sawEmptyMatch) throw DomainError.validation(`${where}: pattern matches an empty string`);
+  if (scan.total > 10_000) throw DomainError.validation(`${where}: too many matches`);
+  const matches = scan.matches;
   if (matches.length === 0)
     throw DomainError.validation(`${where}: '${edit.find}' was not found in the note content`);
-  const replacer = (mt: RegExpExecArray): string =>
-    edit.regex
-      ? mt[0].replace(new RegExp(edit.regex ? edit.find : '', flags.replace('g', '')), edit.replace)
-      : edit.replace;
+  const replacement = (m: RegexMatch): string =>
+    expandReplacement(edit.replace, m, content, literal);
   if (edit.all) {
     let out = '';
     let last = 0;
-    for (const mt of matches) {
-      out += content.slice(last, mt.index) + replacer(mt.match);
-      last = mt.index + mt.length;
+    for (const m of matches) {
+      out += content.slice(last, m.index) + replacement(m);
+      last = m.index + m.length;
     }
     return out + content.slice(last);
   }
@@ -1104,42 +1262,47 @@ export function applyEdit(content: string, edit: TextEdit, where: string): strin
     );
   return (
     content.slice(0, target.index) +
-    replacer(target.match) +
+    replacement(target) +
     content.slice(target.index + target.length)
   );
 }
 
-export function findInContent(
+export async function findInContent(
   content: string,
   find: NonNullable<GetNoteInput['find']>,
-): { matches: ContentMatch[]; total: number } {
-  const flags = (find.flags ?? 'i').replace('g', '');
-  if (!SAFE_FLAGS.test(flags)) throw DomainError.validation(`find.flags '${flags}' is invalid`);
-  let re: RegExp;
-  try {
-    const source = find.regex ? find.pattern : find.pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    re = new RegExp(source, `${flags}g`);
-  } catch (err) {
-    throw DomainError.validation(`find.pattern is not a valid regex: ${(err as Error).message}`);
-  }
+  timeoutMs?: number,
+): Promise<{ matches: ContentMatch[]; total: number }> {
+  const literal = !find.regex;
+  const pattern = compilePattern(
+    literal ? escapeRegex(find.pattern) : find.pattern,
+    find.flags ?? 'i',
+    'find',
+  );
   const max = Math.min(find.maxMatches ?? 20, 200);
-  const matches: ContentMatch[] = [];
-  let total = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    if (m[0].length === 0) {
-      re.lastIndex += 1;
-      continue;
-    }
-    total += 1;
-    if (matches.length < max) {
-      const start = Math.max(0, m.index - 80);
-      const end = Math.min(content.length, m.index + m[0].length + 80);
-      matches.push({ index: m.index, match: m[0], context: content.slice(start, end) });
-    }
-    if (total > 100_000) break;
-  }
-  return { matches, total };
+  const scan = await scanRegex({
+    content,
+    source: pattern.source,
+    flags: pattern.flags,
+    maxMatches: max,
+    maxTotal: 100_000,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  });
+  const matches: ContentMatch[] = scan.matches.map((m) => {
+    const full = m.captures[0] ?? '';
+    const cut = full.length > MAX_MATCH_CHARS;
+    const shown = cut ? full.slice(0, MAX_MATCH_CHARS) : full;
+    const before = content.slice(Math.max(0, m.index - CONTEXT_CHARS), m.index);
+    const afterStart = m.index + m.length;
+    const after = content.slice(afterStart, Math.min(content.length, afterStart + CONTEXT_CHARS));
+    return {
+      index: m.index,
+      length: m.length,
+      match: shown,
+      ...(cut ? { matchTruncated: true } : {}),
+      context: `${before}${shown}${cut ? '…' : ''}${after}`,
+    };
+  });
+  return { matches, total: scan.total };
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,8 +1457,9 @@ export interface Services {
 }
 
 export function createServices(deps: ServiceDeps): Services {
-  const search = new SearchService(deps);
-  const notes = new NotesService(deps);
-  const attributes = new AttributesService(deps, notes);
+  const shared: ServiceDeps = { ...deps, mutex: deps.mutex ?? new KeyedMutex() };
+  const search = new SearchService(shared);
+  const notes = new NotesService(shared);
+  const attributes = new AttributesService(shared, notes);
   return { search, notes, attributes };
 }

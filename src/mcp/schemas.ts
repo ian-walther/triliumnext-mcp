@@ -85,8 +85,10 @@ export const noteDetailSchema = noteSummarySchema.extend({
 
 export const contentMatchSchema = z.object({
   index: z.number(),
-  match: z.string(),
-  context: z.string(),
+  length: z.number().describe('Length of the full match in the content'),
+  match: z.string().describe('Matched text, cut to 500 characters when longer'),
+  matchTruncated: z.boolean().optional(),
+  context: z.string().describe('Up to 80 characters before and after the match'),
 });
 
 export const noteTypeSchema = z.enum(NOTE_TYPES);
@@ -121,4 +123,10 @@ export const attributeOpResultSchema = z.object({
 export const pageMetaSchema = {
   total: z.number().describe('Number of matching items known to the server'),
   nextCursor: z.string().optional().describe('Present when more items exist; pass back as cursor'),
+  truncated: z
+    .boolean()
+    .optional()
+    .describe(
+      'True when more items exist than pagination can reach (ascending order covers the first 1000 matches)',
+    ),
 };

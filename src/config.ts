@@ -268,6 +268,15 @@ export function loadConfig(
     );
   }
   for (const name of LOOPBACK_HOSTS) allowedHosts.add(name);
+  // Origin policy: the SDK only validates Origin automatically on loopback binds.
+  // Off loopback, default to the same hostnames as the Host allow-list so a page
+  // on a foreign origin cannot drive an authenticated session from a browser.
+  // Non-browser MCP clients send no Origin and always pass.
+  const allowedOrigins = envList(env, 'MCP_ALLOWED_ORIGINS');
+  const originsEffective =
+    allowedOrigins.length || isLoopbackHost(host) || allowAnyHost
+      ? allowedOrigins
+      : [...allowedHosts];
 
   const staticTokensRaw = envString(env, 'MCP_STATIC_TOKENS');
   const staticTokens = staticTokensRaw ? parseStaticTokens(staticTokensRaw) : [];
@@ -301,7 +310,7 @@ export function loadConfig(
       ...(jwksUrl !== undefined ? { jwksUrl } : {}),
       scopeClaims: envList(env, 'MCP_OIDC_SCOPE_CLAIMS').length
         ? envList(env, 'MCP_OIDC_SCOPE_CLAIMS')
-        : ['scope', 'permissions', 'scp'],
+        : ['scope', 'scp', 'permissions'],
       algorithms: envList(env, 'MCP_OIDC_ALGORITHMS').length
         ? envList(env, 'MCP_OIDC_ALGORITHMS')
         : [
@@ -347,7 +356,7 @@ export function loadConfig(
       publicUrl: publicUrlRaw,
       allowedHosts: allowAnyHost ? [] : [...allowedHosts],
       allowAnyHost,
-      allowedOrigins: envList(env, 'MCP_ALLOWED_ORIGINS'),
+      allowedOrigins: originsEffective,
       maxBodyBytes: envInt(env, 'MCP_MAX_BODY_BYTES', 4 * 1024 * 1024, 1024),
       rateLimit: {
         perMinute: envInt(env, 'MCP_RATE_LIMIT_PER_MINUTE', 120, 0),

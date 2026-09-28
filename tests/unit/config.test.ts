@@ -89,7 +89,7 @@ describe('loadConfig', () => {
       MCP_PUBLIC_URL: 'https://mcp.example.net/trilium/mcp',
     });
     expect(cfg.auth.oidc?.audience).toBe('https://mcp.example.net/trilium/mcp');
-    expect(cfg.auth.oidc?.scopeClaims).toEqual(['scope', 'permissions', 'scp']);
+    expect(cfg.auth.oidc?.scopeClaims).toEqual(['scope', 'scp', 'permissions']);
   });
   it('parses static tokens', () => {
     expect(() => loadConfig({ ...base, MCP_AUTH_MODE: 'static' })).toThrow(/MCP_STATIC_TOKENS/);

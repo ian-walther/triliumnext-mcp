@@ -23,7 +23,12 @@ function main(): void {
         name: config.serverName,
         version: config.serverVersion,
         services,
-        principal: { id: 'stdio', scopes: config.stdio.scopes, transport: 'stdio' },
+        principal: {
+          id: 'stdio',
+          clientId: 'stdio',
+          scopes: config.stdio.scopes,
+          transport: 'stdio',
+        },
         era,
         audit,
         logger,

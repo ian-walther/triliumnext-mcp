@@ -51,7 +51,7 @@ describe('oidc verifier', () => {
       .setExpirationTime(opts.exp ?? '5m')
       .sign(privateKey);
 
-  it('accepts a valid token and maps scopes from scope and permissions claims', async () => {
+  it('takes delegated scopes from the scope claim and ignores user-wide permissions', async () => {
     const verifier = createOidcVerifier(oidc, { getKey });
     const token = await sign({
       scope: 'openid trilium.read',
@@ -59,8 +59,16 @@ describe('oidc verifier', () => {
     });
     const info = await verifier.verifyAccessToken(token);
     expect(info.clientId).toBe('user|1');
-    expect(info.scopes).toEqual(['trilium.read', 'trilium.write']);
+    expect(info.scopes).toEqual(['trilium.read']);
     expect(info.resource?.href).toBe(oidc.audience);
+  });
+  it('reports the OAuth client separately from the subject', async () => {
+    const verifier = createOidcVerifier(oidc, { getKey });
+    const info = await verifier.verifyAccessToken(
+      await sign({ scope: 'trilium.read', azp: 'client-1' }),
+    );
+    expect(info.clientId).toBe('client-1');
+    expect(info.extra?.['subject']).toBe('user|1');
   });
   it('accepts issuer without trailing slash', async () => {
     const verifier = createOidcVerifier(oidc, { getKey });
@@ -80,9 +88,19 @@ describe('oidc verifier', () => {
     );
     await expect(verifier.verifyAccessToken('not-a-jwt')).rejects.toBeInstanceOf(OAuthError);
   });
-  it('ignores unknown scope values', () => {
+  it('uses the first present claim only and ignores unknown values', () => {
     expect(
       scopesFromClaims({ scope: 'openid profile', scp: ['trilium.admin'] }, ['scope', 'scp']),
-    ).toEqual(['trilium.admin']);
+    ).toEqual([]);
+    expect(scopesFromClaims({ scp: ['trilium.admin', 'x'] }, ['scope', 'scp'])).toEqual([
+      'trilium.admin',
+    ]);
+    expect(
+      scopesFromClaims({ scope: 'trilium.read', permissions: ['trilium.write'] }, [
+        'scope',
+        'scp',
+        'permissions',
+      ]),
+    ).toEqual(['trilium.read']);
   });
 });

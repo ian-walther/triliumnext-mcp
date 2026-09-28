@@ -47,32 +47,25 @@ export class DomainError extends Error {
     if (err instanceof DomainError) return err;
     if (err instanceof EtapiError) {
       const prefix = context ? `${context}: ` : '';
+      // Loggable, payload-free facts about the upstream failure (see THREAT_MODEL T12).
+      const upstream = {
+        etapiCode: err.code,
+        upstreamStatus: err.status,
+        upstreamMethod: err.method,
+        upstreamPath: err.path,
+        kind: err.kind,
+      };
       if (err.status === 404)
-        return new DomainError(
-          'NOT_FOUND',
-          `${prefix}${err.message}`,
-          { etapiCode: err.code },
-          err,
-        );
+        return new DomainError('NOT_FOUND', `${prefix}${err.message}`, upstream, err);
       if (err.code === 'NOTE_IS_PROTECTED')
-        return new DomainError(
-          'PROTECTED',
-          `${prefix}${err.message}`,
-          { etapiCode: err.code },
-          err,
-        );
+        return new DomainError('PROTECTED', `${prefix}${err.message}`, upstream, err);
       if (err.status === 400)
-        return new DomainError(
-          'VALIDATION',
-          `${prefix}${err.message}`,
-          { etapiCode: err.code },
-          err,
-        );
+        return new DomainError('VALIDATION', `${prefix}${err.message}`, upstream, err);
       if (err.status === 401 || err.status === 403) {
         return new DomainError(
           'UPSTREAM',
           `${prefix}Trilium rejected the server's ETAPI token (${err.status}). Check TRILIUM_API_TOKEN.`,
-          { etapiCode: err.code },
+          upstream,
           err,
         );
       }
@@ -81,14 +74,9 @@ export class DomainError extends Error {
         err.kind === 'timeout' ||
         (err.status !== undefined && err.status >= 500)
       ) {
-        return new DomainError(
-          'UPSTREAM_UNAVAILABLE',
-          `${prefix}${err.message}`,
-          { etapiCode: err.code, kind: err.kind },
-          err,
-        );
+        return new DomainError('UPSTREAM_UNAVAILABLE', `${prefix}${err.message}`, upstream, err);
       }
-      return new DomainError('UPSTREAM', `${prefix}${err.message}`, { etapiCode: err.code }, err);
+      return new DomainError('UPSTREAM', `${prefix}${err.message}`, upstream, err);
     }
     const message = err instanceof Error ? err.message : String(err);
     return new DomainError('INTERNAL', context ? `${context}: ${message}` : message, {}, err);

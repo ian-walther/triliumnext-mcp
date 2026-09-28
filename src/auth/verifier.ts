@@ -40,18 +40,27 @@ export function createStaticVerifier(tokens: StaticToken[]): OAuthTokenVerifier 
   };
 }
 
-/** Extract scopes from the claims an OIDC provider may use (Auth0: `scope` string + `permissions` array). */
+/**
+ * Delegated scopes from a token.
+ *
+ * `claimNames` is an ordered preference list; the FIRST claim present in the
+ * token decides and the others are ignored. Claims are never unioned: with
+ * Auth0 RBAC, `scope` carries what the client was granted while `permissions`
+ * lists everything the user holds, so a union would widen a read-only
+ * delegation into write access.
+ */
 export function scopesFromClaims(payload: JWTPayload, claimNames: string[]): Scope[] {
-  const found = new Set<Scope>();
   for (const claim of claimNames) {
     const raw = payload[claim];
+    if (raw === undefined || raw === null) continue;
     const values: string[] =
       typeof raw === 'string' ? raw.split(/[\s,]+/) : Array.isArray(raw) ? raw.map(String) : [];
-    for (const v of values) {
-      if ((SCOPES as readonly string[]).includes(v)) found.add(v as Scope);
-    }
+    const found = new Set(
+      values.filter((v): v is Scope => (SCOPES as readonly string[]).includes(v)),
+    );
+    return SCOPES.filter((s) => found.has(s));
   }
-  return SCOPES.filter((s) => found.has(s));
+  return [];
 }
 
 export interface OidcVerifierOptions {
@@ -86,19 +95,21 @@ export function createOidcVerifier(
         throw invalidToken(`Token rejected: ${(err as Error).message}`);
       }
       if (payload.exp === undefined) throw invalidToken('Token has no expiry');
-      const subject =
-        payload.sub ??
-        (typeof payload['client_id'] === 'string' ? payload['client_id'] : undefined) ??
-        (typeof payload['azp'] === 'string' ? payload['azp'] : undefined);
-      if (!subject) throw invalidToken('Token has no subject');
+      // Separate the OAuth client (azp / client_id) from the user (sub) so audit,
+      // rate limiting and idempotency can tell two clients acting for one user apart.
+      const azp = typeof payload['azp'] === 'string' ? payload['azp'] : undefined;
+      const clientIdClaim =
+        typeof payload['client_id'] === 'string' ? payload['client_id'] : undefined;
+      const clientId = azp ?? clientIdClaim ?? payload.sub;
+      if (!clientId) throw invalidToken('Token has neither azp, client_id nor sub');
       const scopes = scopesFromClaims(payload, oidc.scopeClaims);
       return {
         token,
-        clientId: subject,
+        clientId,
         scopes,
         expiresAt: payload.exp,
         resource: new URL(oidc.audience),
-        extra: { azp: payload['azp'], iss: payload.iss },
+        extra: { subject: payload.sub, iss: payload.iss },
       };
     },
   };

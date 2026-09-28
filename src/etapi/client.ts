@@ -60,6 +60,8 @@ interface RequestSpec {
   contentType?: string;
   accept?: 'json' | 'text' | 'bytes' | 'none';
   retry?: boolean;
+  /** For text reads: stop after this many bytes (the rest of the body is discarded). */
+  maxBytes?: number;
 }
 
 export class TriliumClient {
@@ -119,6 +121,22 @@ export class TriliumClient {
       path: `/notes/${noteId}/content`,
       accept: 'text',
       retry: true,
+    });
+  }
+
+  /**
+   * Read note content without buffering more than `maxBytes` of it. Trilium
+   * sends whole bodies; this stops reading early and cancels the stream so a
+   * multi-megabyte note cannot exhaust memory on a small read.
+   */
+  async readNoteContent(noteId: string, maxBytes: number): Promise<BoundedText> {
+    assertEntityId(noteId);
+    return await this.request<BoundedText>({
+      method: 'GET',
+      path: `/notes/${noteId}/content`,
+      accept: 'text',
+      retry: true,
+      maxBytes,
     });
   }
 
@@ -288,18 +306,9 @@ export class TriliumClient {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url, {
-        method: spec.method,
-        headers,
-        signal: controller.signal,
-        ...(body !== undefined ? { body } : {}),
-      });
-    } catch (cause) {
-      clearTimeout(timer);
+    const transportError = (cause: unknown): EtapiError => {
       const aborted = controller.signal.aborted;
-      throw new EtapiError({
+      return new EtapiError({
         kind: aborted ? 'timeout' : 'network',
         message: aborted
           ? `Trilium request timed out after ${this.timeoutMs}ms: ${spec.method} ${spec.path}`
@@ -308,32 +317,53 @@ export class TriliumClient {
         path: spec.path,
         cause,
       });
-    }
-
+    };
     try {
-      if (!response.ok) {
-        throw await this.toHttpError(response, spec);
-      }
-      if (accept === 'none' || response.status === 204) {
-        await response.arrayBuffer().catch(() => undefined);
-        return undefined as T;
-      }
-      if (accept === 'text') return (await response.text()) as T;
-      if (accept === 'bytes') return new Uint8Array(await response.arrayBuffer()) as T;
-      const text = await response.text();
-      if (text === '') return undefined as T;
+      let response: Response;
       try {
-        return JSON.parse(text) as T;
-      } catch (cause) {
-        throw new EtapiError({
-          kind: 'protocol',
-          message: `Trilium returned non-JSON for ${spec.method} ${spec.path}`,
+        response = await this.fetchImpl(url, {
           method: spec.method,
-          path: spec.path,
-          status: response.status,
-          code: 'INVALID_JSON',
-          cause,
+          headers,
+          signal: controller.signal,
+          ...(body !== undefined ? { body } : {}),
         });
+      } catch (cause) {
+        throw transportError(cause);
+      }
+      // Body consumption can also time out or fail mid-stream; normalize those too.
+      try {
+        if (!response.ok) {
+          throw await this.toHttpError(response, spec);
+        }
+        if (accept === 'none' || response.status === 204) {
+          await response.arrayBuffer().catch(() => undefined);
+          return undefined as T;
+        }
+        if (accept === 'text') {
+          if (spec.maxBytes !== undefined) {
+            return (await readTextBounded(response, spec.maxBytes)) as T;
+          }
+          return (await response.text()) as T;
+        }
+        if (accept === 'bytes') return new Uint8Array(await response.arrayBuffer()) as T;
+        const text = await response.text();
+        if (text === '') return undefined as T;
+        try {
+          return JSON.parse(text) as T;
+        } catch (cause) {
+          throw new EtapiError({
+            kind: 'protocol',
+            message: `Trilium returned non-JSON for ${spec.method} ${spec.path}`,
+            method: spec.method,
+            path: spec.path,
+            status: response.status,
+            code: 'INVALID_JSON',
+            cause,
+          });
+        }
+      } catch (cause) {
+        if (cause instanceof EtapiError) throw cause;
+        throw transportError(cause);
       }
     } finally {
       clearTimeout(timer);
@@ -362,6 +392,73 @@ export class TriliumClient {
       path: spec.path,
     });
   }
+}
+
+export interface BoundedText {
+  content: string;
+  truncated: boolean;
+  /** Total body size when known (Content-Length, or the bytes read when not truncated). */
+  totalBytes?: number;
+}
+
+/** Trim a byte buffer to the last complete UTF-8 sequence. */
+export function trimUtf8(buf: Buffer): Buffer {
+  const end = buf.length;
+  let i = end - 1;
+  // Walk back over continuation bytes to find the lead byte of the last sequence.
+  while (i >= 0 && i >= end - 4 && (buf[i]! & 0xc0) === 0x80) i--;
+  if (i < 0) return buf.subarray(0, 0);
+  const lead = buf[i]!;
+  const needed = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  return end - i >= needed ? buf : buf.subarray(0, i);
+}
+
+async function readTextBounded(response: Response, maxBytes: number): Promise<BoundedText> {
+  const declared = Number(response.headers.get('content-length'));
+  const totalFromHeader = Number.isFinite(declared) && declared >= 0 ? declared : undefined;
+  if (!response.body) {
+    const text = await response.text();
+    const bytes = Buffer.from(text, 'utf8');
+    if (bytes.length <= maxBytes)
+      return { content: text, truncated: false, totalBytes: bytes.length };
+    return {
+      content: trimUtf8(bytes.subarray(0, maxBytes)).toString('utf8'),
+      truncated: true,
+      totalBytes: bytes.length,
+    };
+  }
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let received = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = (await reader.read()) as { done: boolean; value?: Uint8Array };
+      if (done || value === undefined) break;
+      const chunk: Buffer = Buffer.from(value);
+      if (received + chunk.length > maxBytes) {
+        chunks.push(chunk.subarray(0, maxBytes - received));
+        received = maxBytes;
+        truncated = true;
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+      chunks.push(chunk);
+      received += chunk.length;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes: Buffer = Buffer.concat(chunks);
+  return {
+    content: (truncated ? trimUtf8(bytes) : bytes).toString('utf8'),
+    truncated,
+    ...(truncated
+      ? totalFromHeader !== undefined
+        ? { totalBytes: totalFromHeader }
+        : {}
+      : { totalBytes: bytes.length }),
+  };
 }
 
 function describeCause(cause: unknown): string {

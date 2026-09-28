@@ -50,7 +50,14 @@ async function main(): Promise<number> {
     if (passthrough) {
       const result = spawnSync(
         'npx',
-        ['-y', '@modelcontextprotocol/conformance@alpha', 'server', '--url', url, ...passthrough],
+        [
+          '-y',
+          '@modelcontextprotocol/conformance@0.2.0-alpha.11',
+          'server',
+          '--url',
+          url,
+          ...passthrough,
+        ],
         { stdio: 'inherit', env: process.env },
       );
       return result.status === 0 ? 0 : 1;
@@ -59,7 +66,7 @@ async function main(): Promise<number> {
       console.log(`\n=== conformance --requirements ${revision} ===`);
       const args = [
         '-y',
-        '@modelcontextprotocol/conformance@alpha',
+        '@modelcontextprotocol/conformance@0.2.0-alpha.11',
         'server',
         '--url',
         url,

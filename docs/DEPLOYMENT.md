@@ -68,11 +68,12 @@ the path. Requirements:
   `/.well-known/oauth-protected-resource*`.
 - Do **not** expose Trilium itself.
 
-Caddy example:
+Caddy example (keeps the `/trilium` prefix; the server is configured with
+`MCP_HTTP_PATH=/trilium/mcp` and serves `/trilium/healthz` too):
 
 ```
 mcp.ianwalther.com {
-  handle_path /trilium/* {
+  handle /trilium/* {
     reverse_proxy trilium-mcp:3939 {
       flush_interval -1
     }
@@ -83,9 +84,16 @@ mcp.ianwalther.com {
 }
 ```
 
-Note the well-known path must reach the container with its full path
+Do not use `handle_path`, which strips the prefix: the server would then receive
+`/mcp` and answer 404. If you prefer stripping, set `MCP_HTTP_PATH=/mcp` and
+keep `MCP_PUBLIC_URL` at the public `/trilium/mcp`; the well-known route must
+still reach the container unstripped
 (`/.well-known/oauth-protected-resource/trilium/mcp`), which the server serves
 alongside the bare `/.well-known/oauth-protected-resource`.
+
+Origin: off loopback the server accepts browser `Origin` headers only for the
+hostnames in `MCP_ALLOWED_HOSTS` / `MCP_PUBLIC_URL` (set `MCP_ALLOWED_ORIGINS`
+to widen). Non-browser MCP clients send no `Origin` and are unaffected.
 
 ## 5. Identity provider
 
@@ -97,7 +105,7 @@ set the API as the tenant's default audience.
 ## 6. Smoke test before cutover
 
 ```bash
-curl -s https://mcp.ianwalther.com/trilium/healthz
+curl -s https://mcp.ianwalther.com/trilium/healthz   # cached probe; rate limited per peer
 curl -si https://mcp.ianwalther.com/trilium/mcp -X POST -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
 # expect 401 with WWW-Authenticate: Bearer resource_metadata="https://mcp.ianwalther.com/.well-known/oauth-protected-resource/trilium/mcp"
@@ -117,4 +125,8 @@ note. Repeat with Grok and ChatGPT. Compare results with the old server per
 - Upgrade: build a new image, `docker compose up -d`. The server is stateless
   except for the in-memory idempotency store and rate-limit buckets.
 - Rollback: the old `triliumnext-mcp` stdio configurations keep working
-  throughout; nothing here touches them.
+  throughout; nothing here touches them. The legacy reference is branch
+  `tool_defs` (0.3.13 plus output schemas) and the preserved local `build/`,
+  not `main` (which was fast-forwarded to upstream 0.3.17).
+- Single instance: idempotency keys, per-note write serialization and rate
+  limits are process-local. Run one replica.

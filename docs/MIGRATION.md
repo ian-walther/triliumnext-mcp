@@ -13,38 +13,44 @@ step.
 | Claude Code (project `/Users/ianwalther`) | `node …/triliumnext-mcp/build/index.js` | local 0.3.13                                   |
 | Claude.ai / Grok / ChatGPT                | none                                    | —                                              |
 
-## Step 1: local stdio in parallel
+## Step 1: local stdio in parallel (read-only pilot)
 
-Add the new server under a new name so both are available:
+Add the new server under a name that does not exist yet (`trilium-v2`), with
+read scope only, and leave every existing entry in place:
 
 ```json
-"trilium": {
+"trilium-v2": {
   "command": "node",
   "args": ["/Users/ianwalther/code/triliumnext-mcp/dist/stdio.js"],
   "env": {
     "TRILIUM_API_URL": "https://trilium.ianwalther.com/etapi",
     "TRILIUM_API_TOKEN": "<token>",
-    "TRILIUM_MCP_SCOPES": "trilium.read trilium.write"
+    "TRILIUM_MCP_SCOPES": "trilium.read"
   }
 }
 ```
 
-Codex (`~/.codex/config.toml`):
+Codex (`~/.codex/config.toml`), likewise a new table:
 
 ```toml
-[mcp_servers.trilium]
+[mcp_servers.trilium-v2]
 command = "node"
 args = ["/Users/ianwalther/code/triliumnext-mcp/dist/stdio.js"]
 
-[mcp_servers.trilium.env]
+[mcp_servers.trilium-v2.env]
 TRILIUM_API_URL = "https://trilium.ianwalther.com/etapi"
 TRILIUM_API_TOKEN = "<token>"
-TRILIUM_MCP_SCOPES = "trilium.read trilium.write"
+TRILIUM_MCP_SCOPES = "trilium.read"
 ```
 
-Codex per-tool approval keys change with the tool names: `resolve_note_id` →
-`resolve_note`, `list_children_notes` → `list_children`, `update_note` →
-`patch_note` / `update_note_metadata`.
+Enable `trilium.write` on the pilot entry only after the parity check below
+and after the concurrent-write regressions (`tests/unit/auditRegressions.test.ts`)
+pass on the build you run.
+
+Tool names and result shapes changed deliberately (see [PARITY.md](PARITY.md));
+Codex per-tool approval keys move with them: `resolve_note_id` → `resolve_note`,
+`list_children_notes` → `list_children`, `update_note` → `patch_note` /
+`update_note_metadata`.
 
 ## Step 2: parity check
 
@@ -73,5 +79,7 @@ subtree, and review `audit.jsonl` after the first runs.
 
 ## Step 5: retire
 
-Remove the four old entries above, the duplicate `[mcp_servers.triliumnext-mcp]`
-entry, and the `build/` directory. Archive the `main` branch state as a tag.
+Rename `trilium-v2` to `trilium`, remove the four old entries above and the
+duplicate `[mcp_servers.triliumnext-mcp]` entry, then the `build/` directory.
+The legacy rollback reference is branch `tool_defs` (and its preserved
+`build/`), not `main`; tag it before deleting anything.

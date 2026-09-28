@@ -32,7 +32,9 @@ const findSchema = z
     maxMatches: z.number().int().min(1).max(200).optional(),
   })
   .optional()
-  .describe('Locate text inside the content; returns matches with surrounding context.');
+  .describe(
+    'Locate text inside the returned content window (raise maxContentBytes to search further); returns matches with surrounding context.',
+  );
 
 export function readTools(services: Services): AnyToolDefinition[] {
   return [
@@ -211,10 +213,14 @@ export function readTools(services: Services): AnyToolDefinition[] {
             noteSummarySchema.extend({
               contentPreview: z.string().optional(),
               contentTruncated: z.boolean().optional(),
+              previewOmittedReason: z.string().optional(),
             }),
           ),
           childrenTruncated: z.boolean(),
           totalChildren: z.number(),
+          unavailableNoteIds: z
+            .array(z.string())
+            .describe('Child or parent ids Trilium lists that no longer resolve to a note'),
         }),
         annotations: { ...READ_ANNOTATIONS, title: 'Get note with context' },
       },

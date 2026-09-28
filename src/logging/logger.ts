@@ -89,6 +89,8 @@ export const silentLogger: Logger = createLogger({ level: 'error', sink: () => u
 /** Audit events answer: who invoked which tool against which notes, and did it succeed. Never bodies. */
 export interface AuditEvent {
   principal: string;
+  client: string;
+  subject?: string;
   transport: 'stdio' | 'http';
   tool: string;
   noteIds: string[];
@@ -107,26 +109,29 @@ export function createAuditLog(options: {
   enabled: boolean;
   path?: string | undefined;
   logger: Logger;
+  /** Where audit lines go when no file is configured. Independent of LOG_LEVEL. */
+  sink?: (line: string) => void;
   clock?: () => Date;
 }): AuditLog {
   const clock = options.clock ?? (() => new Date());
   if (!options.enabled) return { record: () => undefined };
   const file = options.path;
+  const sink = options.sink ?? ((line: string) => process.stderr.write(`${line}\n`));
   return {
     record(event) {
-      const line = { time: clock().toISOString(), type: 'audit', ...event };
+      const line = JSON.stringify({ time: clock().toISOString(), type: 'audit', ...event });
       if (file) {
         try {
-          appendFileSync(file, `${JSON.stringify(line)}\n`);
+          appendFileSync(file, `${line}\n`);
           return;
         } catch (err) {
-          options.logger.error('audit log write failed, falling back to logger', {
+          options.logger.error('audit log write failed, falling back to stderr', {
             err,
             path: file,
           });
         }
       }
-      options.logger.info('audit', line);
+      sink(line);
     },
   };
 }

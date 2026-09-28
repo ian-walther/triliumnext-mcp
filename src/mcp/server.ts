@@ -11,7 +11,7 @@ import { DomainError } from '../domain/errors.js';
 import type { Services } from '../domain/services.js';
 import type { AuditLog, Logger } from '../logging/logger.js';
 import { hasScope, type Principal } from './policy.js';
-import { fail } from './results.js';
+import { auditMetaOf, fail } from './results.js';
 import { readTools } from './tools/read.js';
 import type { AnyToolDefinition } from './tools/types.js';
 import { writeTools } from './tools/write.js';
@@ -80,16 +80,28 @@ export function buildServer(options: BuildServerOptions): McpServer {
       } else {
         try {
           result = await tool.handler(args, { principal, era });
+          const meta = auditMetaOf(result);
+          if (meta?.code) code = meta.code;
+          if (meta?.noteIds) noteIds = meta.noteIds;
         } catch (err) {
           const domain = DomainError.from(err, tool.name);
-          if (domain.code === 'INTERNAL' || domain.code === 'UPSTREAM_UNAVAILABLE') {
-            logger.error('tool failed', { tool: tool.name, code: domain.code, err: domain });
-          } else {
-            logger.debug('tool returned error', {
-              tool: tool.name,
-              code: domain.code,
-              message: domain.message,
+          // Log facts, never payloads: messages can echo titles or search text.
+          const facts = {
+            tool: tool.name,
+            code: domain.code,
+            etapiCode: domain.details['etapiCode'],
+            upstreamStatus: domain.details['upstreamStatus'],
+            upstreamPath: domain.details['upstreamPath'],
+          };
+          if (domain.code === 'INTERNAL') {
+            logger.error('tool failed', {
+              ...facts,
+              cause: domain.cause instanceof Error ? domain.cause.name : typeof domain.cause,
             });
+          } else if (domain.code === 'UPSTREAM_UNAVAILABLE') {
+            logger.warn('tool failed: Trilium unavailable', facts);
+          } else {
+            logger.debug('tool returned error', facts);
           }
           result = fail(domain);
           code = domain.code;
@@ -97,10 +109,12 @@ export function buildServer(options: BuildServerOptions): McpServer {
       }
       audit.record({
         principal: principal.id,
+        client: principal.clientId,
+        ...(principal.subject !== undefined ? { subject: principal.subject } : {}),
         transport: principal.transport,
         tool: tool.name,
         noteIds,
-        ok: !result.isError,
+        ok: !result.isError && code === undefined,
         ...(code !== undefined ? { code } : {}),
         durationMs: now() - started,
         era,
