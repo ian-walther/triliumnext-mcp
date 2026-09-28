@@ -1,7 +1,7 @@
 /** Domain-level regressions for the second audit pass (R2–R5). */
 import { beforeEach, describe, expect, it } from 'vitest';
 import { IdempotencyStore } from '../../src/domain/idempotency.js';
-import { expandReplacement } from '../../src/domain/regexRunner.js';
+import { expandReplacement, expandReplacementInto } from '../../src/domain/regexRunner.js';
 import {
   applyEdit,
   createServices,
@@ -299,5 +299,113 @@ describe('R5 unknown content length is not reported as zero', () => {
     expect(res.contentBytes).toBeUndefined(); // in-memory Response carries no Content-Length
     expect(res.content).toBe('é'.repeat(512));
     expect(trimUtf8(Buffer.from('aé', 'utf8').subarray(0, 2)).toString('utf8')).toBe('a');
+  });
+});
+
+describe('R3 (pass 3) a single replacement expands under the budget', () => {
+  it('stops token expansion before materializing oversized output', () => {
+    const match = { index: 0, length: 60, captures: ['x'.repeat(60)] };
+    const pieces: string[] = [];
+    let bytes = 0;
+    expect(() =>
+      expandReplacementInto('$&'.repeat(600), match, 'x'.repeat(60), false, (piece) => {
+        bytes += Buffer.byteLength(piece, 'utf8');
+        if (bytes > 100) throw new Error('budget');
+        pieces.push(piece);
+      }),
+    ).toThrow('budget');
+    expect(pieces.length).toBeLessThanOrEqual(2); // never got past the second token
+    const multibyte = { index: 0, length: 2, captures: ['éé'] };
+    let seen = 0;
+    expect(() =>
+      expandReplacementInto(
+        "$1$&$`$'x$<n>",
+        { ...multibyte, captures: ['éé', 'é'], groups: { n: 'ñ' } },
+        'aééb',
+        false,
+        (p) => {
+          seen += Buffer.byteLength(p, 'utf8');
+          if (seen > 6) throw new Error('budget');
+        },
+      ),
+    ).toThrow('budget');
+  });
+
+  it('patch_note reports TOO_LARGE for a huge single expansion without a revision or write', async () => {
+    fake.addNote({
+      noteId: 'mega',
+      title: 'Mega',
+      type: 'code',
+      mime: 'text/plain',
+      parentNoteId: 'home',
+      content: 'a'.repeat(50_000),
+    });
+    const before = fake.calls.length;
+    await expect(
+      services.notes.patch({
+        noteId: 'mega',
+        expectedHash: fake.blobId('mega'),
+        operation: 'edit',
+        edits: [{ find: 'a+', replace: '$&'.repeat(600), regex: true }],
+      }),
+    ).rejects.toMatchObject({ code: 'TOO_LARGE' });
+    const after = fake.calls.slice(before);
+    expect(after.some((c) => c.method === 'PUT' || /\/revision$/.test(c.path))).toBe(false);
+    expect(fake.notes.get('mega')?.content).toBe('a'.repeat(50_000));
+    // ordinary expansions still work
+    await expect(
+      applyEdit('abc', { find: 'b', replace: '[$&$&]', regex: true }, 'e', 500, 100),
+    ).resolves.toBe('a[bb]c');
+  });
+});
+
+describe('R4 (pass 3) named captures never read inherited properties', () => {
+  for (const name of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
+    it(`$<${name}> with another named group present → native result`, async () => {
+      const expected = 'abc'.replace(/(?<x>b)/, `$<${name}>`);
+      expect(expected).toBe('ac');
+      await expect(
+        applyEdit('abc', { find: '(?<x>b)', replace: `$<${name}>`, regex: true }, 'e', 500),
+      ).resolves.toBe(expected);
+    });
+  }
+  it('explicitly declared groups with those names substitute their own captures', async () => {
+    await expect(
+      applyEdit('abc', { find: '(?<toString>b)', replace: '[$<toString>]', regex: true }, 'e', 500),
+    ).resolves.toBe('a[b]c');
+    await expect(
+      applyEdit(
+        'abc',
+        { find: '(?<constructor>b)', replace: '[$<constructor>]', regex: true },
+        'e',
+        500,
+      ),
+    ).resolves.toBe('a[b]c');
+    expect(
+      expandReplacement(
+        '$<toString>',
+        { index: 0, length: 1, captures: ['b'], groups: { x: 'b' } },
+        'b',
+        false,
+      ),
+    ).toBe('');
+  });
+  it('tool-level: the stored content matches native replacement', async () => {
+    fake.addNote({
+      noteId: 'abc',
+      title: 'ABC',
+      type: 'code',
+      mime: 'text/plain',
+      parentNoteId: 'home',
+      content: 'abc',
+    });
+    const res = await services.notes.patch({
+      noteId: 'abc',
+      expectedHash: fake.blobId('abc'),
+      operation: 'edit',
+      edits: [{ find: '(?<x>b)', replace: '$<toString>', regex: true }],
+    });
+    expect(fake.notes.get('abc')?.content).toBe('ac');
+    expect(res.editsApplied).toBe(1);
   });
 });

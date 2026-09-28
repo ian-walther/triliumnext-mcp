@@ -25,7 +25,7 @@ import { KeyedMutex } from './keyedMutex.js';
 import {
   compilePattern,
   escapeRegex,
-  expandReplacement,
+  expandReplacementInto,
   scanRegex,
   type RegexMatch,
 } from './regexRunner.js';
@@ -1271,8 +1271,6 @@ export async function applyEdit(
   const matches = scan.matches;
   if (matches.length === 0)
     throw DomainError.validation(`${where}: '${edit.find}' was not found in the note content`);
-  const replacement = (m: RegexMatch): string =>
-    expandReplacement(edit.replace, m, content, literal);
 
   // Assemble under a byte budget: stop as soon as the output would exceed it,
   // instead of building a huge string only to measure and reject it.
@@ -1306,7 +1304,8 @@ export async function applyEdit(
   let last = 0;
   for (const m of chosen) {
     out.push(content.slice(last, m.index));
-    out.push(replacement(m));
+    // Expand token by token so the budget applies before any large piece is materialized.
+    expandReplacementInto(edit.replace, m, content, literal, (piece) => out.push(piece));
     last = m.index + m.length;
   }
   out.push(content.slice(last));

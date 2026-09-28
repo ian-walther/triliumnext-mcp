@@ -143,37 +143,68 @@ export function scanRegex(options: ScanOptions): Promise<ScanResult> {
 
 /**
  * Expand a String.prototype.replace-style template ($&, $1, $<name>, $$, $\`, $')
- * against one match of `content`. Returns the literal template when `literal`.
+ * against one match of `content`, emitting each literal run and token value
+ * through `emit` as it is produced. Because nothing is joined here, an `emit`
+ * that enforces a byte budget bounds the expansion before any large string is
+ * materialized (AUDIT R3). Named captures are substituted only when they are
+ * own properties of the group map, matching JavaScript, so `$<toString>` cannot
+ * read inherited members (AUDIT R4).
  */
+export function expandReplacementInto(
+  template: string,
+  match: RegexMatch,
+  content: string,
+  literal: boolean,
+  emit: (piece: string) => void,
+): void {
+  if (literal) {
+    emit(template);
+    return;
+  }
+  const re = /\$(\$|&|`|'|\d{1,2}|<([^>]*)>)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(template)) !== null) {
+    if (m.index > last) emit(template.slice(last, m.index));
+    last = m.index + m[0].length;
+    const token = m[1]!;
+    const name = m[2];
+    if (token === '$') emit('$');
+    else if (token === '&') emit(match.captures[0] ?? '');
+    else if (token === '`') emit(content.slice(0, match.index));
+    else if (token === "'") emit(content.slice(match.index + match.length));
+    else if (token.startsWith('<')) {
+      // JavaScript keeps "$<name>" literal when the pattern has no named groups,
+      // and substitutes the empty string for an unknown or unmatched name otherwise.
+      const groups = match.groups;
+      if (groups === undefined || groups === null) emit(m[0]);
+      else emit(Object.hasOwn(groups, name ?? '') ? (groups[name ?? ''] ?? '') : '');
+    } else {
+      const n = Number(token);
+      if (n >= 1 && n < match.captures.length) emit(match.captures[n] ?? '');
+      else if (
+        token.length === 2 &&
+        Number(token[0]) >= 1 &&
+        Number(token[0]) < match.captures.length
+      ) {
+        // "$12" with fewer groups falls back to "$1" followed by "2", like replace().
+        emit((match.captures[Number(token[0])] ?? '') + token[1]);
+      } else emit(m[0]);
+    }
+  }
+  if (last < template.length) emit(template.slice(last));
+}
+
+/** Convenience wrapper without a budget; the edit path uses expandReplacementInto. */
 export function expandReplacement(
   template: string,
   match: RegexMatch,
   content: string,
   literal: boolean,
 ): string {
-  if (literal) return template;
-  return template.replace(
-    /\$(\$|&|`|'|\d{1,2}|<([^>]*)>)/g,
-    (whole, token: string, name: string | undefined) => {
-      if (token === '$') return '$';
-      if (token === '&') return match.captures[0] ?? '';
-      if (token === '`') return content.slice(0, match.index);
-      if (token === "'") return content.slice(match.index + match.length);
-      if (token.startsWith('<')) {
-        // JavaScript keeps "$<name>" literal when the pattern has no named groups,
-        // and substitutes the empty string for an unknown or unmatched name otherwise.
-        if (match.groups === undefined || match.groups === null) return whole;
-        return match.groups[name ?? ''] ?? '';
-      }
-      const n = Number(token);
-      if (n >= 1 && n < match.captures.length) return match.captures[n] ?? '';
-      if (token.length === 2) {
-        // "$12" with fewer groups falls back to "$1" followed by "2", like replace().
-        const first = Number(token[0]);
-        if (first >= 1 && first < match.captures.length)
-          return (match.captures[first] ?? '') + token[1];
-      }
-      return whole;
-    },
-  );
+  const parts: string[] = [];
+  expandReplacementInto(template, match, content, literal, (piece) => {
+    parts.push(piece);
+  });
+  return parts.join('');
 }
