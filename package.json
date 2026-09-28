@@ -1,36 +1,54 @@
 {
-  "name": "triliumnext-mcp",
-  "version": "0.3.17",
-  "description": "A model context protocol server for TriliumNext Notes",
+  "name": "trilium-mcp",
+  "version": "2.0.0",
+  "description": "Model Context Protocol server for TriliumNext Notes: stdio for local agents, authenticated Streamable HTTP for cloud agents.",
+  "private": true,
   "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "bin": {
-    "triliumnext-mcp": "./build/index.js"
+    "trilium-mcp-stdio": "./dist/stdio.js",
+    "trilium-mcp-http": "./dist/http.js"
   },
   "files": [
-    "build"
+    "dist"
   ],
   "scripts": {
-    "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
-    "prepare": "npm run build",
-    "watch": "tsc --watch",
-    "test": "npm run build && node --test tests",
-    "test:unit": "npm run build && node --test tests/unit",
-    "test:integration": "npm run build && node --test tests/integration",
-    "test:e2e": "npm run build && node --test tests/e2e",
-    "check": "npm run test",
-    "inspector": "npx @modelcontextprotocol/inspector build/index.js"
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run --project unit",
+    "test:watch": "vitest --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:all": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test",
+    "start:stdio": "node dist/stdio.js",
+    "start:http": "node dist/http.js",
+    "inspector": "npx @modelcontextprotocol/inspector node dist/stdio.js",
+    "conformance": "node scripts/conformance.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.2",
-    "axios": "^1.8.3",
-    "marked": "^16.3.0",
-    "mime-db": "^1.54.0",
-    "node-html-parser": "^7.1.0",
-    "safe-regex2": "^5.1.0"
+    "@hono/node-server": "^2.1.1",
+    "@modelcontextprotocol/hono": "^2.0.1",
+    "@modelcontextprotocol/server": "^2.1.0",
+    "hono": "^4.13.9",
+    "jose": "^6.2.12",
+    "marked": "^18.0.14",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/node": "^20.11.24",
-    "typescript": "^5.3.3",
-    "zod": "^3.24.1"
+    "@eslint/js": "^10.0.1",
+    "@modelcontextprotocol/client": "^2.1.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^10.11.0",
+    "prettier": "^3.9.9",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^5.0.2"
   }
 }

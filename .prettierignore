@@ -1,0 +1,7 @@
+dist
+build
+node_modules
+coverage
+results
+package-lock.json
+docs/reference/etapi.openapi.yaml
