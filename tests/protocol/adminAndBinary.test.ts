@@ -297,13 +297,19 @@ describe('binary content over the wire', () => {
         },
       },
     ];
-    let maxGap = 0;
+    // Event-loop gaps between timer ticks. A baseline tick runs before the
+    // loop and the test yields afterwards, so a loop that blocked the whole
+    // time shows up as one long gap in a sample taken after it (AUDIT R15 P3).
+    const gaps: number[] = [];
     let last = performance.now();
     const ticker = setInterval(() => {
       const now = performance.now();
-      maxGap = Math.max(maxGap, now - last);
+      gaps.push(now - last);
       last = now;
     }, 5);
+    const yieldToTimers = () => new Promise((r) => setTimeout(r, 15));
+    await yieldToTimers();
+    const baselineSamples = gaps.length;
     const started = performance.now();
     try {
       for (const bad of inputs)
@@ -311,11 +317,14 @@ describe('binary content over the wire', () => {
           const res = await client.callTool(call);
           expect(res.isError).toBe(true);
         }
+      await yieldToTimers();
     } finally {
       clearInterval(ticker);
     }
+    expect(baselineSamples).toBeGreaterThanOrEqual(1);
+    expect(gaps.length).toBeGreaterThan(baselineSamples); // at least one sample saw the loop
     expect(performance.now() - started).toBeLessThan(2000); // 24 rejections, was ~2 s each before
-    expect(maxGap).toBeLessThan(250);
+    expect(Math.max(...gaps)).toBeLessThan(250);
     expect(harness.fake.calls.slice(before).filter((c) => c.method !== 'GET')).toEqual([]);
     expect(harness.fake.revisions.length).toBe(revisionsBefore);
     expect(harness.fake.blobId(note.noteId)).toBe(note.contentHash);
