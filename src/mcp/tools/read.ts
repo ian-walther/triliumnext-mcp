@@ -82,7 +82,7 @@ export function readTools(services: Services): AnyToolDefinition[] {
             .max(100)
             .optional()
             .describe(
-              "Sort by a note property or label, e.g. 'dateModified', 'title', 'labelCount'",
+              "Sort by a note property or label, e.g. 'dateModified', 'title', 'labelCount'. Ascending order is computed over the first 1000 matches.",
             ),
           orderDirection: z.enum(['asc', 'desc']).optional(),
           limit: z

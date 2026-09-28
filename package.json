@@ -29,7 +29,7 @@
     "start:stdio": "node dist/stdio.js",
     "start:http": "node dist/http.js",
     "inspector": "npx @modelcontextprotocol/inspector node dist/stdio.js",
-    "conformance": "node scripts/conformance.mjs"
+    "conformance": "npm run build && tsx scripts/conformance.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.1",

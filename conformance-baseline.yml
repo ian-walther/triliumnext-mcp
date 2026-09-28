@@ -1,0 +1,50 @@
+# Known conformance failures. Each entry is a scenario that cannot pass against
+# a real, tools-only Trilium server because it requires fixture tools, prompts,
+# or resources that only the reference "everything" server provides.
+# See docs/CONFORMANCE.md for the reasoning behind each group.
+server:
+  # need fixture tools with specific names (test_simple_text, json_schema_2020_12_tool, ...)
+  - tools-call-simple-text
+  - tools-call-image
+  - tools-call-audio
+  - tools-call-embedded-resource
+  - tools-call-mixed-content
+  - tools-call-error
+  - tools-call-with-progress
+  - json-schema-2020-12
+  - http-custom-header-server-validation
+  # server offers no prompts / resources / completions
+  - completion-complete
+  - resources-list
+  - resources-read-text
+  - resources-read-binary
+  - resources-templates-read
+  - prompts-list
+  - prompts-get-simple
+  - prompts-get-with-args
+  - prompts-get-embedded-resource
+  - prompts-get-with-image
+  # input_required (server→client round trips) is not used by any tool
+  - input-required-result-basic-elicitation
+  - input-required-result-basic-sampling
+  - input-required-result-basic-list-roots
+  - input-required-result-request-state
+  - input-required-result-multiple-input-requests
+  - input-required-result-multi-round
+  - input-required-result-non-tool-request
+  - input-required-result-result-type
+  - input-required-result-tampered-state
+  - input-required-result-capability-check
+  # server-stateless: 24/28 pass; the 4 failures are diagnostic-tool checks (not testable)
+  - server-stateless
+  # tasks extension not implemented
+  - tasks-lifecycle
+  - tasks-capability-negotiation
+  - tasks-wire-fields
+  - tasks-request-state-removal
+  - tasks-mrtr-input
+  - tasks-request-headers
+  - tasks-dispatch-and-envelope
+  - tasks-required-task-error
+  - tasks-mrtr-composition
+client: []

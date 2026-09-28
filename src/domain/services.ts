@@ -149,18 +149,24 @@ export class SearchService {
     // only use it when the caller asks for it and nothing else is in play.
     const fastSearch =
       input.fastSearch === true && !input.orderBy && !input.criteria?.length && !input.query;
+    // Verified against Trilium 0.103: the `orderBy` query parameter sorts, but the
+    // direction is always descending (`orderDirection` is parsed with parseInt and
+    // ignored) and an `orderBy` clause inside the search string is not applied.
+    // Ascending order is therefore computed here over a bounded window.
+    const ascending = input.orderBy !== undefined && (input.orderDirection ?? 'asc') === 'asc';
+    const fetchLimit = ascending
+      ? Math.max(offset + limit + 1, ASCENDING_WINDOW)
+      : offset + limit + 1;
     const params: EtapiSearchParams = {
       search: query,
       fastSearch,
       includeArchivedNotes: input.includeArchived ?? false,
-      // Fetch one page past the requested window so we know whether more exist.
-      limit: offset + limit + 1,
+      limit: fetchLimit,
+      ...(input.orderBy !== undefined ? { orderBy: orderByProperty(input.orderBy) } : {}),
       ...(input.ancestorNoteId !== undefined ? { ancestorNoteId: input.ancestorNoteId } : {}),
       ...(input.ancestorDepth !== undefined
         ? { ancestorDepth: `lt${input.ancestorDepth + 1}` }
         : {}),
-      ...(input.orderBy !== undefined ? { orderBy: input.orderBy } : {}),
-      ...(input.orderDirection !== undefined ? { orderDirection: input.orderDirection } : {}),
     };
     let response;
     try {
@@ -168,7 +174,8 @@ export class SearchService {
     } catch (err) {
       throw DomainError.from(err, `search '${query}'`);
     }
-    const all = (response.results ?? []).map(toNoteSummary);
+    let all = (response.results ?? []).map(toNoteSummary);
+    if (ascending) all = all.reverse();
     const page = paginate(all, offset, limit);
     return { ...page, query };
   }
@@ -315,6 +322,17 @@ export class SearchService {
       message: `Path '${path}' matches ${current.length} notes`,
     };
   }
+}
+
+/** Ascending sorts are computed client-side; this bounds how many results are fetched for them. */
+export const ASCENDING_WINDOW = 1000;
+
+/** Trilium's `orderBy` parameter takes a bare note property (`title`, `dateCreated`) or label name. */
+export function orderByProperty(orderBy: string): string {
+  const name = orderBy.trim().replace(/^(note\.|#)/, '');
+  if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(name))
+    throw DomainError.validation(`Invalid orderBy '${orderBy}'`);
+  return name;
 }
 
 /** Exact title (case-insensitive) first, then folders, then most recently modified. */
@@ -577,40 +595,32 @@ export class NotesService {
     const direction = input.orderDirection ?? 'asc';
     const ids = parent.childNoteIds ?? [];
     if (ids.length === 0) return { items: [], total: 0 };
-    let all: NoteSummary[];
-    if (orderBy === 'position') {
-      // One search call for the bodies, tree order from the parent's childNoteIds.
-      const res = await client
-        .searchNotes({
-          search: `note.parents.noteId = ${quote(input.noteId)}`,
-          fastSearch: false,
-          includeArchivedNotes: true,
-          limit: ids.length + 1,
-        })
-        .catch((err: unknown) => {
-          throw DomainError.from(err, `list children of ${input.noteId}`);
-        });
-      const byId = new Map((res.results ?? []).map((n) => [n.noteId, n] as const));
-      all = ids
-        .map((id) => byId.get(id))
-        .filter((n): n is EtapiNote => Boolean(n))
-        .map(toNoteSummary);
-      if (direction === 'desc') all.reverse();
-    } else {
-      const res = await client
-        .searchNotes({
-          search: `note.parents.noteId = ${quote(input.noteId)}`,
-          fastSearch: false,
-          includeArchivedNotes: true,
-          orderBy,
-          orderDirection: direction,
-          limit: ids.length + 1,
-        })
-        .catch((err: unknown) => {
-          throw DomainError.from(err, `list children of ${input.noteId}`);
-        });
-      all = (res.results ?? []).map(toNoteSummary);
+    // One search call for the bodies; tree order comes from the parent's childNoteIds.
+    const res = await client
+      .searchNotes({
+        search: `note.parents.noteId = ${quote(input.noteId)}`,
+        fastSearch: false,
+        includeArchivedNotes: true,
+        limit: ids.length + 1,
+      })
+      .catch((err: unknown) => {
+        throw DomainError.from(err, `list children of ${input.noteId}`);
+      });
+    const byId = new Map((res.results ?? []).map((n) => [n.noteId, n] as const));
+    const all = ids
+      .map((id) => byId.get(id))
+      .filter((n): n is EtapiNote => Boolean(n))
+      .map(toNoteSummary);
+    if (orderBy !== 'position') {
+      const key = (n: NoteSummary): string =>
+        orderBy === 'title'
+          ? n.title.toLowerCase()
+          : orderBy === 'dateCreated'
+            ? n.dateCreated
+            : n.utcDateModified;
+      all.sort((a, b) => key(a).localeCompare(key(b)));
     }
+    if (direction === 'desc') all.reverse();
     return paginate(all, offset, limit);
   }
 
@@ -832,11 +842,7 @@ export class NotesService {
       }
     }
     try {
-      await client.putNoteContent(
-        input.noteId,
-        next,
-        current.type === 'text' ? 'text/html' : 'text/plain',
-      );
+      await client.putNoteContent(input.noteId, next);
     } catch (err) {
       throw DomainError.from(err, `write content of ${input.noteId}`);
     }
@@ -942,6 +948,10 @@ export class NotesService {
         throw DomainError.from(err, `${where}: resolve relation target`);
       });
     let matches = (res.results ?? []).filter((n) => n.title === value);
+    if (matches.length === 0) {
+      const builtIn = await this.builtInTemplateId(value);
+      if (builtIn) return builtIn;
+    }
     if (matches.length > 1 && relationName === 'template') {
       const templates = matches.filter((n) =>
         n.attributes?.some(
@@ -961,6 +971,42 @@ export class NotesService {
           .map((n) => ({ noteId: n.noteId, title: n.title, type: n.type })),
       },
     );
+  }
+
+  private builtInTemplates: Promise<Map<string, string>> | undefined;
+
+  /**
+   * Built-in templates (Board, Calendar, Text Snippet, ...) live in Trilium's
+   * hidden subtree, which search never returns. Resolve them by walking the
+   * `_templates` folder once per process; titles and a few aliases are matched
+   * case-insensitively.
+   */
+  private builtInTemplateId(title: string): Promise<string | undefined> {
+    const { client } = this.deps;
+    this.builtInTemplates ??= (async () => {
+      const map = new Map<string, string>();
+      try {
+        const folder = await client.getNote('_templates');
+        const children = await fetchNotesById(client, folder.childNoteIds ?? []);
+        for (const note of children.values()) {
+          map.set(note.title.toLowerCase(), note.noteId);
+          // `_template_geo_map` → "geo map"; also accept the id suffix with underscores.
+          map.set(
+            note.noteId
+              .replace(/^_template_/, '')
+              .replace(/_/g, ' ')
+              .toLowerCase(),
+            note.noteId,
+          );
+        }
+        if (!map.has('board') && map.has('kanban board'))
+          map.set('board', map.get('kanban board')!);
+      } catch {
+        /* older Trilium without the folder: no built-ins */
+      }
+      return map;
+    })();
+    return this.builtInTemplates.then((map) => map.get(title.trim().toLowerCase()));
   }
 
   async addAttribute(noteId: string, def: AttributeInput): Promise<AttributeOpResult> {

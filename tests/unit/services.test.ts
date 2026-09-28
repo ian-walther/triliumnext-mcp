@@ -62,13 +62,6 @@ beforeEach(() => {
     content: '<p>Office sink</p>',
   });
   fake.addNote({
-    noteId: '_template_board',
-    title: 'Board',
-    type: 'book',
-    parentNoteId: 'root',
-    labels: { template: '' },
-  });
-  fake.addNote({
     noteId: 'script',
     title: 'Script',
     type: 'code',
@@ -439,5 +432,36 @@ describe('AttributesService', () => {
     ]);
     expect(removed.results[0]?.ok).toBe(true);
     expect(removed.note.attributes.some((a) => a.name === 'priority')).toBe(false);
+  });
+});
+
+describe('search ordering', () => {
+  it('uses the orderBy parameter, computes ascending client-side, and validates names', async () => {
+    const desc = await services.search.search({
+      criteria: [{ type: 'noteProperty', property: 'parents.noteId', value: 'home' }],
+      orderBy: 'title',
+      orderDirection: 'desc',
+    });
+    expect(fake.calls.at(-1)?.query['orderBy']).toBe('title');
+    expect(desc.items.map((n) => n.title)).toEqual(['Plumbing', 'Garden']);
+    const asc = await services.search.search({
+      criteria: [{ type: 'noteProperty', property: 'parents.noteId', value: 'home' }],
+      orderBy: 'note.title',
+      orderDirection: 'asc',
+      limit: 1,
+    });
+    expect(asc.items.map((n) => n.title)).toEqual(['Garden']);
+    expect(asc.nextCursor).toBeDefined();
+    const page2 = await services.search.search({
+      criteria: [{ type: 'noteProperty', property: 'parents.noteId', value: 'home' }],
+      orderBy: 'note.title',
+      orderDirection: 'asc',
+      limit: 1,
+      cursor: asc.nextCursor,
+    });
+    expect(page2.items.map((n) => n.title)).toEqual(['Plumbing']);
+    await expect(
+      services.search.search({ text: 'x', orderBy: 'note.title; drop' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
   });
 });

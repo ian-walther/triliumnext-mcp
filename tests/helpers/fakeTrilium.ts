@@ -55,6 +55,16 @@ export interface FakeTriliumOptions {
   now?: () => Date;
 }
 
+export const BUILT_IN_TEMPLATES: Record<string, string> = {
+  _template_board: 'Kanban Board',
+  _template_calendar: 'Calendar',
+  _template_text_snippet: 'Text Snippet',
+  _template_grid_view: 'Grid View',
+  _template_list_view: 'List View',
+  _template_table: 'Table',
+  _template_geo_map: 'Geo Map',
+};
+
 let idCounter = 0;
 export function fakeId(prefix = 'n'): string {
   idCounter += 1;
@@ -89,6 +99,26 @@ export class FakeTrilium {
     this.noAuth = options.noAuth ?? false;
     this.now = options.now ?? (() => new Date());
     this.addNote({ noteId: 'root', title: 'root', type: 'book', parentNoteId: null });
+    this.addNote({ noteId: '_hidden', title: 'Hidden Notes', type: 'doc', parentNoteId: 'root' });
+    this.addNote({
+      noteId: '_templates',
+      title: 'Built-in templates',
+      type: 'book',
+      parentNoteId: '_hidden',
+    });
+    for (const [id, title] of Object.entries(BUILT_IN_TEMPLATES)) {
+      this.addNote({
+        noteId: id,
+        title,
+        type: id === '_template_text_snippet' ? 'text' : 'book',
+        parentNoteId: '_templates',
+        labels: { template: '' },
+      });
+    }
+  }
+
+  private isHidden(noteId: string): boolean {
+    return noteId === '_hidden' || this.ancestorsOf(noteId).includes('_hidden');
   }
 
   // ---- seeding ------------------------------------------------------------
@@ -248,10 +278,13 @@ export class FakeTrilium {
     return this.attributesOf(noteId).some((a) => a.type === 'label' && a.name === 'archived');
   }
 
-  search(query: string, params: Record<string, string>): FakeNote[] {
+  search(rawQuery: string, params: Record<string, string>): FakeNote[] {
+    // Trilium tokenizes an in-query orderBy clause but does not apply it via ETAPI.
+    const query = rawQuery.replace(/\s+orderBy\s+\S+(?:\s+(?:asc|desc))?\s*$/i, '');
     const predicate = parseQuery(query);
+    // Like Trilium, search never returns the hidden subtree.
     let candidates = [...this.notes.values()].filter(
-      (n) => n.noteId !== 'root' || /noteId/.test(query),
+      (n) => !this.isHidden(n.noteId) && (n.noteId !== 'root' || /noteId/.test(query)),
     );
     if (params['includeArchivedNotes'] !== 'true')
       candidates = candidates.filter((n) => !this.isArchived(n.noteId));
@@ -263,12 +296,14 @@ export class FakeTrilium {
     let results = candidates.filter((n) => predicate(this.evalContext(n, fast)));
     const orderBy = params['orderBy'];
     if (orderBy) {
-      const dir = params['orderDirection'] === 'desc' ? -1 : 1;
-      results.sort((a, b) => {
-        const va = String(this.property(a, orderBy) ?? '');
-        const vb = String(this.property(b, orderBy) ?? '');
-        return va.localeCompare(vb) * dir;
-      });
+      // Like Trilium 0.103: sorts by the property, always descending (orderDirection is ignored).
+      results.sort((a, b) =>
+        String(this.property(b, orderBy) ?? '').localeCompare(
+          String(this.property(a, orderBy) ?? ''),
+        ),
+      );
+    } else {
+      results.sort((a, b) => (a.title < b.title ? -1 : a.title > b.title ? 1 : 0));
     }
     if (params['limit']) results = results.slice(0, Number(params['limit']));
     return results;
@@ -504,6 +539,8 @@ export class FakeTrilium {
           headers: { 'content-type': note.mime || 'text/plain' },
         });
       if (method === 'PUT') {
+        if (!contentType.startsWith('text/plain'))
+          throw new HttpError(500, 'GENERIC', `Cannot set null content to noteId '${note.noteId}'`);
         note.content = body;
         note.utcDateModified = this.now().toISOString();
         note.dateModified = local(this.now());

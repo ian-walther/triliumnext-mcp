@@ -49,7 +49,15 @@ export function buildServer(options: BuildServerOptions): McpServer {
     { name: options.name, version: options.version },
     {
       instructions: SERVER_INSTRUCTIONS,
-      cacheHints: { 'tools/list': { ttlMs: 5 * 60 * 1000, cacheScope: 'private' } },
+      // No prompts or resources are offered, but declaring the capabilities makes the
+      // list methods answer with empty, cacheable results instead of "method not found".
+      capabilities: { prompts: {}, resources: {} },
+      cacheHints: {
+        'tools/list': { ttlMs: 5 * 60 * 1000, cacheScope: 'private' },
+        'prompts/list': { ttlMs: 60 * 60 * 1000, cacheScope: 'public' },
+        'resources/list': { ttlMs: 60 * 60 * 1000, cacheScope: 'public' },
+        'resources/templates/list': { ttlMs: 60 * 60 * 1000, cacheScope: 'public' },
+      },
     },
   );
 
