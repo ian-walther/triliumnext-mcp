@@ -19,6 +19,29 @@ export interface FakeNote {
   utcDateCreated: string;
   utcDateModified: string;
   isArchived?: boolean;
+  /** Set for file/image notes whose body was uploaded as application/octet-stream. */
+  binary?: Buffer;
+}
+
+export interface FakeAttachment {
+  attachmentId: string;
+  ownerId: string;
+  role: string;
+  mime: string;
+  title: string;
+  position: number;
+  content: Buffer;
+  utcDateModified: string;
+  utcDateScheduledForErasureSince: string | null;
+}
+
+/** A soft-deleted note with everything needed to undelete it (like Trilium's deleted rows). */
+export interface DeletedNote {
+  note: FakeNote;
+  branches: FakeBranch[];
+  attributes: FakeAttribute[];
+  attachments: FakeAttachment[];
+  deleteId: string;
 }
 
 export interface FakeBranch {
@@ -46,7 +69,9 @@ export interface RecordedCall {
   method: string;
   path: string;
   query: Record<string, string>;
+  /** Request body as UTF-8 text; binary uploads are recorded as `[binary N bytes]`. */
   body?: string;
+  contentType?: string;
 }
 
 export interface FakeTriliumOptions {
@@ -71,8 +96,12 @@ export function fakeId(prefix = 'n'): string {
   return `${prefix}${idCounter.toString(36).padStart(11, '0')}`;
 }
 
-function blobIdFor(content: string): string {
+function blobIdFor(content: string | Buffer): string {
   return createHash('sha1').update(content).digest('base64url').slice(0, 20);
+}
+
+function noteBlobId(note: FakeNote): string {
+  return blobIdFor(note.binary ?? note.content);
 }
 
 function local(date: Date): string {
@@ -85,6 +114,9 @@ export class FakeTrilium {
   readonly notes = new Map<string, FakeNote>();
   readonly branches = new Map<string, FakeBranch>();
   readonly attributes = new Map<string, FakeAttribute>();
+  readonly attachments = new Map<string, FakeAttachment>();
+  /** Soft-deleted notes keyed by noteId; `undelete` restores from here. */
+  readonly deleted = new Map<string, DeletedNote>();
   readonly revisions: Array<{ noteId: string; description: string; content: string }> = [];
   readonly calls: RecordedCall[] = [];
   /** Inject failures: return a response for a matching call, or undefined to proceed. */
@@ -179,6 +211,102 @@ export class FakeTrilium {
     return branch;
   }
 
+  addAttachment(init: {
+    ownerId: string;
+    title: string;
+    mime?: string;
+    role?: string;
+    content?: string | Buffer;
+    position?: number;
+  }): FakeAttachment {
+    const attachment: FakeAttachment = {
+      attachmentId: fakeId('t'),
+      ownerId: init.ownerId,
+      role: init.role ?? 'file',
+      mime: init.mime ?? 'text/plain',
+      title: init.title,
+      position: init.position ?? 10,
+      content: Buffer.isBuffer(init.content)
+        ? init.content
+        : Buffer.from(init.content ?? '', 'utf8'),
+      utcDateModified: this.now().toISOString(),
+      utcDateScheduledForErasureSince: null,
+    };
+    this.attachments.set(attachment.attachmentId, attachment);
+    return attachment;
+  }
+
+  attachmentPojo(a: FakeAttachment): Record<string, unknown> {
+    return {
+      attachmentId: a.attachmentId,
+      ownerId: a.ownerId,
+      role: a.role,
+      mime: a.mime,
+      title: a.title,
+      position: a.position,
+      blobId: blobIdFor(a.content),
+      dateModified: local(new Date(a.utcDateModified)),
+      utcDateModified: a.utcDateModified,
+      utcDateScheduledForErasureSince: a.utcDateScheduledForErasureSince,
+      contentLength: a.content.length,
+    };
+  }
+
+  /**
+   * Soft-delete like Trilium: the note, its branches, owned attributes and
+   * attachments move to `deleted`; children that lose their last live parent
+   * go with it (same deleteId, so undelete can bring them back together).
+   */
+  deleteNoteCascade(noteId: string, deleteId = fakeId('d')): void {
+    const note = this.notes.get(noteId);
+    if (!note) return;
+    const branches = [...this.branches.values()].filter(
+      (b) => b.noteId === noteId || b.parentNoteId === noteId,
+    );
+    const childIds = branches.filter((b) => b.parentNoteId === noteId).map((b) => b.noteId);
+    for (const b of branches) this.branches.delete(b.branchId);
+    const attributes = [...this.attributes.values()].filter((a) => a.noteId === noteId);
+    for (const a of attributes) this.attributes.delete(a.attributeId);
+    const attachments = [...this.attachments.values()].filter((a) => a.ownerId === noteId);
+    for (const a of attachments) this.attachments.delete(a.attachmentId);
+    this.notes.delete(noteId);
+    this.deleted.set(noteId, { note, branches, attributes, attachments, deleteId });
+    for (const childId of childIds) {
+      if (this.parentsOf(childId).length === 0) this.deleteNoteCascade(childId, deleteId);
+    }
+  }
+
+  undeleteNoteCascade(noteId: string): boolean {
+    const entry = this.deleted.get(noteId);
+    if (!entry) return false;
+    // A child's own parent branch was recorded with the parent it was deleted
+    // through, and the caller re-adds it before recursing; count those too.
+    const parentBranches = entry.branches.filter(
+      (b) => b.noteId === noteId && this.notes.has(b.parentNoteId),
+    );
+    if (parentBranches.length === 0 && this.parentsOf(noteId).length === 0) return false;
+    this.deleted.delete(noteId);
+    this.notes.set(noteId, entry.note);
+    for (const b of parentBranches) this.branches.set(b.branchId, b);
+    for (const a of entry.attributes) this.attributes.set(a.attributeId, a);
+    for (const a of entry.attachments) this.attachments.set(a.attachmentId, a);
+    // Children deleted in the same cascade come back with their branches.
+    for (const b of entry.branches.filter((b) => b.parentNoteId === noteId)) {
+      const child = this.deleted.get(b.noteId);
+      if (child && child.deleteId === entry.deleteId) {
+        this.branches.set(b.branchId, b);
+        this.undeleteNoteCascade(b.noteId);
+      } else if (this.notes.has(b.noteId)) {
+        this.branches.set(b.branchId, b);
+      }
+    }
+    return true;
+  }
+
+  private isDescendant(noteId: string, ancestorId: string): boolean {
+    return this.ancestorsOf(noteId).includes(ancestorId);
+  }
+
   addAttribute(init: {
     noteId: string;
     type: 'label' | 'relation';
@@ -256,7 +384,7 @@ export class FakeTrilium {
       title: note.isProtected ? '[protected]' : note.title,
       type: note.type,
       mime: note.mime,
-      blobId: blobIdFor(note.content),
+      blobId: noteBlobId(note),
       dateCreated: note.dateCreated,
       dateModified: note.dateModified,
       utcDateCreated: note.utcDateCreated,
@@ -270,7 +398,7 @@ export class FakeTrilium {
   }
 
   blobId(noteId: string): string {
-    return blobIdFor(this.notes.get(noteId)!.content);
+    return noteBlobId(this.notes.get(noteId)!);
   }
 
   // ---- search DSL subset ---------------------------------------------------
@@ -396,13 +524,20 @@ export class FakeTrilium {
     const url = new URL(request.url);
     const path = url.pathname.replace(/^.*?\/etapi/, '');
     const query = Object.fromEntries(url.searchParams.entries());
-    const body =
-      request.method === 'GET' || request.method === 'DELETE' ? undefined : await request.text();
+    const contentType = request.headers.get('content-type') ?? '';
+    const raw =
+      request.method === 'GET' || request.method === 'DELETE'
+        ? undefined
+        : Buffer.from(await request.arrayBuffer());
+    const binary = contentType.startsWith('application/octet-stream');
     const call: RecordedCall = {
       method: request.method,
       path,
       query,
-      ...(body !== undefined ? { body } : {}),
+      ...(raw !== undefined
+        ? { body: binary ? `[binary ${raw.length} bytes]` : raw.toString('utf8') }
+        : {}),
+      ...(contentType ? { contentType } : {}),
     };
     this.calls.push(call);
     const intercepted = await this.intercept?.(call);
@@ -411,13 +546,7 @@ export class FakeTrilium {
       return err(401, 'NOT_AUTHENTICATED', 'Not authenticated');
     }
     try {
-      return this.route(
-        request.method,
-        path,
-        query,
-        body ?? '',
-        request.headers.get('content-type') ?? '',
-      );
+      return this.route(request.method, path, query, raw ?? Buffer.alloc(0), contentType);
     } catch (e) {
       if (e instanceof HttpError) return err(e.status, e.code, e.message);
       return err(500, 'GENERIC', (e as Error).message);
@@ -428,9 +557,10 @@ export class FakeTrilium {
     method: string,
     path: string,
     query: Record<string, string>,
-    body: string,
+    raw: Buffer,
     contentType: string,
   ): Response {
+    const body = raw.toString('utf8');
     const m = (re: RegExp) => re.exec(path);
     let match: RegExpExecArray | null;
     if (method === 'GET' && path === '/app-info') {
@@ -517,13 +647,32 @@ export class FakeTrilium {
         return json(this.notePojo(note));
       }
       if (method === 'DELETE') {
-        if (note) {
-          this.notes.delete(note.noteId);
-          for (const [id, b] of this.branches)
-            if (b.noteId === note.noteId) this.branches.delete(id);
-        }
+        if (note) this.deleteNoteCascade(note.noteId);
         return new Response(null, { status: 204 });
       }
+    }
+    if ((match = m(/^\/notes\/([^/]+)\/undelete$/)) && method === 'POST') {
+      const id = match[1]!;
+      if (this.notes.has(id))
+        throw new HttpError(400, 'NOTE_NOT_DELETED', `Note '${id}' is not deleted.`);
+      if (!this.deleted.has(id))
+        throw new HttpError(404, 'NOTE_NOT_FOUND', `Note '${id}' not found.`);
+      if (!this.undeleteNoteCascade(id))
+        throw new HttpError(
+          400,
+          'NOTE_HAS_NO_UNDELETED_PARENT',
+          `Note '${id}' has no undeleted parent; undelete a parent first.`,
+        );
+      return json({ success: true });
+    }
+    if ((match = m(/^\/notes\/([^/]+)\/attachments$/)) && method === 'GET') {
+      const note = this.notes.get(match[1]!);
+      if (!note) throw new HttpError(404, 'NOTE_NOT_FOUND', `Note '${match[1]}' not found.`);
+      const list = [...this.attachments.values()]
+        .filter((a) => a.ownerId === note.noteId)
+        .sort((a, b) => a.position - b.position)
+        .map((a) => this.attachmentPojo(a));
+      return json(list);
     }
     if ((match = m(/^\/notes\/([^/]+)\/content$/))) {
       const note = this.notes.get(match[1]!);
@@ -534,15 +683,27 @@ export class FakeTrilium {
           'NOTE_IS_PROTECTED',
           `Note '${note.noteId}' is protected and content cannot be read through ETAPI.`,
         );
-      if (method === 'GET')
-        return new Response(note.content, {
+      if (method === 'GET') {
+        // Like express: whole bodies with a Content-Length.
+        const bytes = note.binary ?? Buffer.from(note.content, 'utf8');
+        return new Response(bytes, {
           status: 200,
-          headers: { 'content-type': note.mime || 'text/plain' },
+          headers: {
+            'content-type': note.mime || 'text/plain',
+            'content-length': String(bytes.length),
+          },
         });
+      }
       if (method === 'PUT') {
-        if (!contentType.startsWith('text/plain'))
+        if (contentType.startsWith('application/octet-stream')) {
+          note.binary = Buffer.from(raw);
+          note.content = '';
+        } else if (contentType.startsWith('text/plain')) {
+          note.content = body;
+          delete note.binary;
+        } else {
           throw new HttpError(500, 'GENERIC', `Cannot set null content to noteId '${note.noteId}'`);
-        note.content = body;
+        }
         note.utcDateModified = this.now().toISOString();
         note.dateModified = local(this.now());
         return new Response(null, { status: 204 });
@@ -563,16 +724,27 @@ export class FakeTrilium {
         noteId: string;
         parentNoteId: string;
         notePosition?: number;
+        prefix?: string | null;
+        isExpanded?: boolean;
       };
       if (!this.notes.has(def.noteId))
         throw new HttpError(404, 'NOTE_NOT_FOUND', `Note '${def.noteId}' not found.`);
       if (!this.notes.has(def.parentNoteId))
         throw new HttpError(404, 'NOTE_NOT_FOUND', `Note '${def.parentNoteId}' not found.`);
+      if (def.noteId === def.parentNoteId || this.isDescendant(def.parentNoteId, def.noteId))
+        throw new HttpError(
+          400,
+          'GENERIC',
+          `Cannot clone note '${def.noteId}' under '${def.parentNoteId}': it would create a cycle.`,
+        );
       const existing = [...this.branches.values()].find(
         (b) => b.noteId === def.noteId && b.parentNoteId === def.parentNoteId,
       );
-      if (existing) return json(existing, 200);
-      return json(this.addBranch(def.noteId, def.parentNoteId, def.notePosition), 201);
+      const branch = existing ?? this.addBranch(def.noteId, def.parentNoteId, def.notePosition);
+      if (existing && typeof def.notePosition === 'number') branch.notePosition = def.notePosition;
+      if (def.prefix !== undefined) branch.prefix = def.prefix;
+      if (typeof def.isExpanded === 'boolean') branch.isExpanded = def.isExpanded;
+      return json(branch, existing ? 200 : 201);
     }
     if ((match = m(/^\/branches\/([^/]+)$/))) {
       const branch = this.branches.get(match[1]!);
@@ -584,11 +756,100 @@ export class FakeTrilium {
       if (method === 'PATCH') {
         if (!branch)
           throw new HttpError(404, 'BRANCH_NOT_FOUND', `Branch '${match[1]}' not found.`);
-        Object.assign(branch, JSON.parse(body) as Partial<FakeBranch>);
+        const patch = JSON.parse(body) as Record<string, unknown>;
+        for (const key of Object.keys(patch))
+          if (!['prefix', 'notePosition', 'isExpanded'].includes(key))
+            throw new HttpError(
+              400,
+              'PROPERTY_NOT_ALLOWED',
+              `Property '${key}' is not allowed for this method.`,
+            );
+        Object.assign(branch, patch);
         return json(branch);
       }
       if (method === 'DELETE') {
-        if (branch) this.branches.delete(branch.branchId);
+        if (branch) {
+          this.branches.delete(branch.branchId);
+          // Like Trilium: the last branch takes the note with it.
+          if (this.parentsOf(branch.noteId).length === 0) this.deleteNoteCascade(branch.noteId);
+        }
+        return new Response(null, { status: 204 });
+      }
+    }
+    if (method === 'POST' && path === '/attachments') {
+      const def = JSON.parse(body) as {
+        ownerId: string;
+        role: string;
+        mime: string;
+        title: string;
+        content?: string;
+        position?: number;
+      };
+      if (!this.notes.has(def.ownerId))
+        throw new HttpError(404, 'NOTE_NOT_FOUND', `Note '${def.ownerId}' not found.`);
+      for (const key of ['role', 'mime', 'title'])
+        if (typeof (def as Record<string, unknown>)[key] !== 'string')
+          throw new HttpError(
+            400,
+            'PROPERTY_VALIDATION_ERROR',
+            `Validation failed on property '${key}'`,
+          );
+      const attachment = this.addAttachment({
+        ownerId: def.ownerId,
+        role: def.role,
+        mime: def.mime,
+        title: def.title,
+        content: def.content ?? '',
+        ...(def.position !== undefined ? { position: def.position } : {}),
+      });
+      return json(this.attachmentPojo(attachment), 201);
+    }
+    if ((match = m(/^\/attachments\/([^/]+)$/))) {
+      const attachment = this.attachments.get(match[1]!);
+      if (!attachment)
+        throw new HttpError(404, 'ATTACHMENT_NOT_FOUND', `Attachment '${match[1]}' not found.`);
+      if (method === 'GET') return json(this.attachmentPojo(attachment));
+      if (method === 'PATCH') {
+        const patch = JSON.parse(body) as Record<string, unknown>;
+        for (const key of Object.keys(patch))
+          if (!['role', 'mime', 'title', 'position'].includes(key))
+            throw new HttpError(
+              400,
+              'PROPERTY_NOT_ALLOWED',
+              `Property '${key}' is not allowed for this method.`,
+            );
+        if (typeof patch['role'] === 'string') attachment.role = patch['role'];
+        if (typeof patch['mime'] === 'string') attachment.mime = patch['mime'];
+        if (typeof patch['title'] === 'string') attachment.title = patch['title'];
+        if (typeof patch['position'] === 'number') attachment.position = patch['position'];
+        attachment.utcDateModified = this.now().toISOString();
+        return json(this.attachmentPojo(attachment));
+      }
+      if (method === 'DELETE') {
+        this.attachments.delete(attachment.attachmentId);
+        return new Response(null, { status: 204 });
+      }
+    }
+    if ((match = m(/^\/attachments\/([^/]+)\/content$/))) {
+      const attachment = this.attachments.get(match[1]!);
+      if (!attachment)
+        throw new HttpError(404, 'ATTACHMENT_NOT_FOUND', `Attachment '${match[1]}' not found.`);
+      if (method === 'GET')
+        return new Response(attachment.content, {
+          status: 200,
+          headers: {
+            'content-type': attachment.mime || 'application/octet-stream',
+            'content-length': String(attachment.content.length),
+          },
+        });
+      if (method === 'PUT') {
+        if (
+          !contentType.startsWith('text/plain') &&
+          !contentType.startsWith('application/octet-stream')
+        )
+          throw new HttpError(400, 'GENERIC', 'Unsupported content type');
+        attachment.content = Buffer.from(raw);
+        attachment.utcDateModified = this.now().toISOString();
         return new Response(null, { status: 204 });
       }
     }

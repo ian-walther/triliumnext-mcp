@@ -84,7 +84,9 @@ every connect attempt (so a user-type client grant never catches up), and
 requests only OIDC profile scopes, never `trilium.*`, so even a granted client
 would get a token without tool scopes. Pass `AUTH0_USER_EMAIL` (and
 `AUTH0_USER_PERMISSIONS`, default `trilium.read`) to grant permissions to a
-user once that user exists.
+user once that user exists. `trilium.admin` unlocks the destructive tools
+(`delete_note`, `undelete_note`, `delete_attachment`); grant it to your own
+user only, and reconnect the client afterwards so a fresh token carries it.
 
 Tenant as configured on 2026-09-28: `dev-edyrjulnnb8tuhvu.us.auth0.com`, API
 identifier `https://trilium-mcp.ianwalther.com/mcp`. The Google connection

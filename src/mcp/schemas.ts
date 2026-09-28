@@ -130,3 +130,36 @@ export const pageMetaSchema = {
       'True when more items exist than pagination can reach (ascending order covers the first 1000 matches)',
     ),
 };
+
+export const attachmentSchema = z.object({
+  attachmentId: z.string(),
+  ownerNoteId: z.string().describe('The note that owns the attachment'),
+  role: z.string().describe("Trilium role, usually 'file' or 'image'"),
+  mime: z.string(),
+  title: z.string(),
+  position: z.number(),
+  contentHash: z
+    .string()
+    .describe('Trilium blobId of the current content. Pass as expectedHash when replacing it.'),
+  contentLength: z.number().optional().describe('Size in bytes when Trilium reports it'),
+  utcDateModified: z.string().optional(),
+  scheduledForErasure: z
+    .boolean()
+    .describe('True once the attachment has been deleted and awaits erasure'),
+});
+
+export const branchSchema = z.object({
+  branchId: z.string(),
+  noteId: z.string(),
+  parentNoteId: z.string(),
+  prefix: z.string().nullable(),
+  notePosition: z.number(),
+  isExpanded: z.boolean(),
+});
+
+export const base64Schema = z
+  .string()
+  .regex(/^[A-Za-z0-9+/\r\n]*={0,2}$/, 'contentBase64 must be standard base64')
+  .describe(
+    'Binary content as standard base64 (a data: URI is also accepted). Decoded size is limited by MCP_MAX_WRITE_CONTENT_BYTES.',
+  );

@@ -50,7 +50,10 @@ pass on the build you run.
 Tool names and result shapes changed deliberately (see [PARITY.md](PARITY.md));
 Codex per-tool approval keys move with them: `resolve_note_id` → `resolve_note`,
 `list_children_notes` → `list_children`, `update_note` → `patch_note` /
-`update_note_metadata`.
+`update_note_metadata`, `move_note` → `move_note` (branch-based, keeps prefix
+and position), `delete_note` → `delete_note` (scope `trilium.admin`, needs
+`confirm` and `expectedTitle`, reversible with `undelete_note`), and the old
+`fileUri` upload → `create_note` with `contentBase64` or `create_attachment`.
 
 ## Step 2: parity check
 

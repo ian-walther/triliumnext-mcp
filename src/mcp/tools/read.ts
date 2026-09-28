@@ -1,8 +1,11 @@
 /** Read-only tools (scope trilium.read). */
+import type { CallToolResult } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
+import { isImageMime } from '../../domain/binary.js';
 import type { Services } from '../../domain/services.js';
-import { ok } from '../results.js';
+import { ok, okWith, withAudit } from '../results.js';
 import {
+  attachmentSchema,
   attributeViewSchema,
   contentMatchSchema,
   criterionSchema,
@@ -145,7 +148,7 @@ export function readTools(services: Services): AnyToolDefinition[] {
       config: {
         title: 'Get note',
         description:
-          'Read one note: metadata, attributes, parents/children ids, and content. Returns contentHash, which patch_note requires. Content is truncated at maxContentBytes (default 256 KiB); contentTruncated tells you. Use format=plain to strip HTML from text notes.',
+          'Read one note: metadata, attributes, parents/children ids, and content. Returns contentHash, which patch_note requires. Content is truncated at maxContentBytes (default 256 KiB); contentTruncated tells you. Use format=plain to strip HTML from text notes. File/image notes return contentBase64 (images also as an image content block) or, when larger than maxContentBytes, only their size.',
         inputSchema: z.object({
           noteId: noteIdSchema,
           includeContent: z.boolean().optional().describe('Default true'),
@@ -161,6 +164,10 @@ export function readTools(services: Services): AnyToolDefinition[] {
         outputSchema: z.object({
           note: noteDetailSchema,
           content: z.string().optional(),
+          contentBase64: z
+            .string()
+            .optional()
+            .describe('Body of file/image notes, base64 (never truncated; omitted with a reason)'),
           contentFormat: z.enum(['raw', 'plain']).optional(),
           contentTruncated: z.boolean().optional(),
           contentBytes: z.number().optional(),
@@ -171,7 +178,14 @@ export function readTools(services: Services): AnyToolDefinition[] {
         annotations: { ...READ_ANNOTATIONS, title: 'Get note' },
       },
       noteIds: (args) => [args.noteId],
-      handler: async (args) => ok(await services.notes.get(args)),
+      handler: async (args) => {
+        const result = await services.notes.get(args);
+        return result.contentBase64 !== undefined && isImageMime(result.note.mime)
+          ? okWith(result, [
+              { type: 'image', data: result.contentBase64, mimeType: result.note.mime },
+            ])
+          : ok(result);
+      },
     }),
     defineTool({
       name: 'get_note_context',
@@ -275,5 +289,70 @@ export function readTools(services: Services): AnyToolDefinition[] {
       noteIds: (args) => [args.noteId],
       handler: async (args) => ok(await services.attributes.read(args)),
     }),
+    defineTool({
+      name: 'list_attachments',
+      scope: 'trilium.read',
+      config: {
+        title: 'List attachments',
+        description:
+          "List a note's attachments (images pasted into it, files attached to it): id, title, mime, role, size and contentHash. No content is fetched; use get_attachment.",
+        inputSchema: z.object({ noteId: noteIdSchema }),
+        outputSchema: z.object({
+          note: noteSummarySchema,
+          attachments: z.array(attachmentSchema),
+        }),
+        annotations: { ...READ_ANNOTATIONS, title: 'List attachments' },
+      },
+      noteIds: (args) => [args.noteId],
+      handler: async (args) => ok(await services.attachments.list(args.noteId)),
+    }),
+    defineTool({
+      name: 'get_attachment',
+      scope: 'trilium.read',
+      config: {
+        title: 'Get attachment',
+        description:
+          'Read one attachment: metadata plus content. Text-like mime types come back as content (UTF-8, truncated at maxContentBytes); everything else as contentBase64, and images additionally as an image content block. Binary bodies larger than maxContentBytes are omitted with their size; raise the limit to fetch them.',
+        inputSchema: z.object({
+          attachmentId: z
+            .string()
+            .regex(/^[A-Za-z0-9_]{1,64}$/, 'attachmentId must be 1-64 characters of [A-Za-z0-9_]')
+            .describe('From list_attachments'),
+          includeContent: z.boolean().optional().describe('Default true'),
+          maxContentBytes: z.number().int().min(1024).optional(),
+        }),
+        outputSchema: z.object({
+          attachment: attachmentSchema,
+          content: z.string().optional(),
+          contentBase64: z.string().optional(),
+          contentBytes: z.number().optional(),
+          contentTruncated: z.boolean().optional(),
+          contentOmittedReason: z.string().optional(),
+          isImage: z.boolean(),
+        }),
+        annotations: { ...READ_ANNOTATIONS, title: 'Get attachment' },
+      },
+      noteIds: () => [],
+      handler: async (args) => {
+        const result = await services.attachments.get(args);
+        return withAttachmentNote(
+          result.contentBase64 !== undefined && result.isImage
+            ? okWith(result, [
+                {
+                  type: 'image',
+                  data: result.contentBase64,
+                  mimeType: result.attachment.mime,
+                },
+              ])
+            : ok(result),
+          result.attachment.ownerNoteId,
+        );
+      },
+    }),
   ];
+}
+
+/** Attachments are addressed by their own id; record the owning note for the audit trail. */
+function withAttachmentNote(result: CallToolResult, ownerNoteId: string): CallToolResult {
+  return withAudit(result, { noteIds: [ownerNoteId] });
 }

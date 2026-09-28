@@ -14,7 +14,11 @@ import {
   truncateContent,
   type ContentFormat,
 } from './content.js';
+import { AttachmentsService } from './attachments.js';
+import { decodeBinaryInput } from './binary.js';
+import { DeletionService } from './deletion.js';
 import { DomainError } from './errors.js';
+import { HierarchyService } from './hierarchy.js';
 import {
   fingerprintOf,
   IdempotencyKeyMismatch,
@@ -39,6 +43,7 @@ import {
   type NoteSummary,
 } from './model.js';
 import { buildSearchQuery, quote, type Criterion } from './query/builder.js';
+import { assertHash, fetchNote, fetchNotesById } from './shared.js';
 
 export interface ServiceLimits {
   maxWriteContentBytes: number;
@@ -78,38 +83,6 @@ const CONTEXT_CHARS = 80;
 
 // ---------------------------------------------------------------------------
 // helpers
-
-async function fetchNote(client: TriliumClient, noteId: string): Promise<EtapiNote> {
-  try {
-    return await client.getNote(noteId);
-  } catch (err) {
-    if (err instanceof EtapiError && err.isNotFound) throw DomainError.notFound('Note', noteId);
-    throw DomainError.from(err, `get note ${noteId}`);
-  }
-}
-
-/**
- * Fetch several notes. Vanished notes (404) are reported in `missing`; any other
- * failure (timeout, outage, auth) is raised, because silently dropping a child
- * would make a partial hierarchy look complete.
- */
-async function fetchNotesById(
-  client: TriliumClient,
-  ids: string[],
-  context: string,
-): Promise<{ notes: Map<string, EtapiNote>; missing: string[] }> {
-  const notes = new Map<string, EtapiNote>();
-  const missing: string[] = [];
-  const results = await Promise.allSettled(ids.map((id) => client.getNote(id)));
-  let failure: unknown;
-  results.forEach((r, i) => {
-    if (r.status === 'fulfilled') notes.set(ids[i]!, r.value);
-    else if (r.reason instanceof EtapiError && r.reason.isNotFound) missing.push(ids[i]!);
-    else failure ??= r.reason;
-  });
-  if (failure !== undefined) throw DomainError.from(failure, context);
-  return { notes, missing };
-}
 
 function encodeCursor(offset: number): string {
   return Buffer.from(`o:${offset}`, 'utf8').toString('base64url');
@@ -450,6 +423,8 @@ export interface ContentMatch {
 export interface GetNoteResult {
   note: NoteDetail;
   content?: string;
+  /** Body of file/image notes, base64-encoded (never truncated: omitted with a reason instead). */
+  contentBase64?: string;
   contentFormat?: ReadFormat;
   contentTruncated?: boolean;
   contentBytes?: number;
@@ -508,6 +483,8 @@ export interface CreateNoteInput {
   type?: string | undefined;
   mime?: string | undefined;
   content?: string | undefined;
+  /** Binary body for file/image notes (base64 or data: URI). */
+  contentBase64?: string | undefined;
   contentFormat?: ContentFormat | undefined;
   attributes?: AttributeInput[] | undefined;
   ifTitleExists?: 'error' | 'create' | 'return_existing' | undefined;
@@ -550,6 +527,8 @@ export interface PatchNoteInput {
   expectedHash: string;
   operation: 'replace' | 'append' | 'prepend' | 'edit';
   content?: string | undefined;
+  /** Replacement body for file/image notes (operation 'replace' only). */
+  contentBase64?: string | undefined;
   contentFormat?: ContentFormat | undefined;
   edits?: TextEdit[] | undefined;
   separator?: string | undefined;
@@ -590,14 +569,28 @@ export class NotesService {
       result.contentOmittedReason = 'Note is protected; ETAPI cannot read protected content';
       return result;
     }
-    if (BINARY_TYPES.has(raw.type)) {
-      result.contentOmittedReason = `Binary '${raw.type}' content is not returned; use Trilium directly for attachments`;
-      return result;
-    }
     const maxBytes = Math.min(
       input.maxContentBytes ?? limits.defaultReadContentBytes,
       limits.maxReadContentBytes,
     );
+    if (BINARY_TYPES.has(raw.type)) {
+      let blob;
+      try {
+        blob = await client.readNoteContentBytes(input.noteId, maxBytes);
+      } catch (err) {
+        throw DomainError.from(err, `get content of ${input.noteId}`);
+      }
+      if (blob.totalBytes !== undefined) result.contentBytes = blob.totalBytes;
+      if (blob.truncated) {
+        // A cut binary body is useless; report the size instead.
+        result.contentOmittedReason = `Binary '${raw.type}' content exceeds maxContentBytes (${maxBytes}); raise it up to ${limits.maxReadContentBytes}`;
+        return result;
+      }
+      result.contentBase64 = blob.bytes.toString('base64');
+      result.contentFormat = 'raw';
+      result.contentTruncated = false;
+      return result;
+    }
     let bounded;
     try {
       bounded = await client.readNoteContent(input.noteId, maxBytes);
@@ -726,9 +719,17 @@ export class NotesService {
       throw DomainError.validation(`Unknown note type '${type}'`, { allowed: NOTE_TYPES });
     }
     if (BINARY_TYPES.has(type)) {
-      throw new DomainError(
-        'UNSUPPORTED',
-        `Creating '${type}' notes (binary attachments) is not supported by this server`,
+      if (input.contentBase64 === undefined) {
+        throw DomainError.validation(
+          `'${type}' notes take their body from contentBase64 (base64 or a data: URI), plus mime`,
+        );
+      }
+      if (input.content !== undefined && input.content !== '') {
+        throw DomainError.validation(`'${type}' notes take contentBase64, not content`);
+      }
+    } else if (input.contentBase64 !== undefined) {
+      throw DomainError.validation(
+        `contentBase64 is only for 'file' and 'image' notes; '${type}' notes take content`,
       );
     }
     if (type === 'code' && input.mime === undefined) {
@@ -749,6 +750,7 @@ export class NotesService {
       type,
       mime: input.mime ?? null,
       content: input.content ?? '',
+      contentBase64: input.contentBase64 ?? null,
       contentFormat: input.contentFormat ?? 'auto',
       attributes: input.attributes ?? [],
       position: input.position ?? 'last',
@@ -866,13 +868,26 @@ export class NotesService {
       }
     }
 
-    const normalized = normalizeContentForWrite({
-      noteType: type,
-      content: input.content ?? '',
-      format: input.contentFormat,
-      maxBytes: limits.maxWriteContentBytes,
-    });
-    warnings.push(...normalized.warnings);
+    // Binary bodies are decoded (and size-checked) before anything is created.
+    const binary =
+      BINARY_TYPES.has(type) && input.contentBase64 !== undefined
+        ? decodeBinaryInput(input.contentBase64, limits.maxWriteContentBytes, 'contentBase64')
+        : undefined;
+    const mime = input.mime ?? binary?.mime;
+    if (binary && !mime) {
+      throw DomainError.validation(
+        `'${type}' notes need a mime type (e.g. image/png, application/pdf) unless the data: URI carries one`,
+      );
+    }
+    const normalized = binary
+      ? undefined
+      : normalizeContentForWrite({
+          noteType: type,
+          content: input.content ?? '',
+          format: input.contentFormat,
+          maxBytes: limits.maxWriteContentBytes,
+        });
+    if (normalized) warnings.push(...normalized.warnings);
 
     let attributeDefs: Array<AttributeInput & { targetNoteId?: string }> = [];
     if (input.attributes?.length) {
@@ -888,8 +903,8 @@ export class NotesService {
         parentNoteId,
         title,
         type,
-        content: normalized.content,
-        ...(input.mime !== undefined ? { mime: input.mime } : {}),
+        content: normalized?.content ?? '',
+        ...(mime !== undefined ? { mime } : {}),
         ...(input.position === 'first' ? { notePosition: 0 } : {}),
       });
       createdNote = resp.note;
@@ -907,6 +922,19 @@ export class NotesService {
         partial: { attributeResults: [...attributeResults], warnings: [...warnings] },
       });
     mark();
+    if (binary) {
+      try {
+        await client.putNoteContentBytes(createdNote.noteId, binary.bytes);
+      } catch (err) {
+        throw DomainError.from(
+          err,
+          `upload binary content of ${createdNote.noteId} (the note exists but is empty)`,
+        );
+      }
+      // The upload changed the blobId; keep the checkpoint honest for replays.
+      createdNote = await fetchNote(client, createdNote.noteId);
+      mark();
+    }
     for (const def of attributeDefs) {
       attributeResults.push(await this.addAttribute(createdNote.noteId, def));
       mark();
@@ -918,7 +946,7 @@ export class NotesService {
       note: toNoteDetail(finalNote),
       branchId,
       created: true,
-      contentFormat: normalized.inputFormat,
+      contentFormat: normalized?.inputFormat ?? 'binary',
       attributeResults,
       warnings,
       idempotentReplay: false,
@@ -943,11 +971,12 @@ export class NotesService {
         'PROTECTED',
         `Note '${input.noteId}' is protected and cannot be modified through ETAPI`,
       );
-    if (BINARY_TYPES.has(current.type))
-      throw new DomainError(
-        'UNSUPPORTED',
-        `Note '${input.noteId}' is a '${current.type}' note; binary content is not writable through this server`,
+    if (BINARY_TYPES.has(current.type)) return this.patchBinary(current, input);
+    if (input.contentBase64 !== undefined) {
+      throw DomainError.validation(
+        `contentBase64 is only for 'file' and 'image' notes; '${current.type}' notes take content`,
       );
+    }
     assertHash(current, input.expectedHash);
 
     let existing: string;
@@ -1052,6 +1081,54 @@ export class NotesService {
       revisionCreated,
       editsApplied,
       contentBytes: bytes,
+      warnings,
+    };
+  }
+
+  /** Hash-protected replacement of a file/image note's body. */
+  private async patchBinary(current: EtapiNote, input: PatchNoteInput): Promise<PatchNoteResult> {
+    const { client, limits } = this.deps;
+    if (input.operation !== 'replace' || input.contentBase64 === undefined) {
+      throw DomainError.validation(
+        `'${current.type}' notes only support operation 'replace' with contentBase64`,
+      );
+    }
+    assertHash(current, input.expectedHash);
+    const binary = decodeBinaryInput(
+      input.contentBase64,
+      limits.maxWriteContentBytes,
+      'contentBase64',
+    );
+    const recheck = await fetchNote(client, input.noteId);
+    assertHash(recheck, input.expectedHash);
+    let revisionCreated = false;
+    if (input.createRevision !== false) {
+      try {
+        await client.createRevision(input.noteId, 'trilium-mcp patch_note');
+        revisionCreated = true;
+      } catch (err) {
+        throw DomainError.from(err, `create revision of ${input.noteId} (content left unchanged)`);
+      }
+    }
+    try {
+      await client.putNoteContentBytes(input.noteId, binary.bytes);
+    } catch (err) {
+      throw DomainError.from(err, `write content of ${input.noteId}`);
+    }
+    const warnings: string[] = [];
+    if (binary.mime && binary.mime !== current.mime) {
+      warnings.push(
+        `The data: URI says '${binary.mime}' but the note's mime is '${current.mime}'; use update_note_metadata to change it`,
+      );
+    }
+    const after = await fetchNote(client, input.noteId);
+    return {
+      note: toNoteDetail(after),
+      previousHash: current.blobId,
+      contentHash: after.blobId,
+      revisionCreated,
+      editsApplied: 0,
+      contentBytes: binary.bytes.length,
       warnings,
     };
   }
@@ -1241,20 +1318,6 @@ function requireContent(input: PatchNoteInput): string {
   if (input.content === undefined)
     throw DomainError.validation(`operation '${input.operation}' requires content`);
   return input.content;
-}
-
-function assertHash(note: EtapiNote, expectedHash: string): void {
-  if (note.blobId !== expectedHash) {
-    throw new DomainError(
-      'CONFLICT',
-      `Note '${note.noteId}' has changed since it was read (current hash ${note.blobId}, expected ${expectedHash}). Call get_note again and retry with the new contentHash.`,
-      {
-        noteId: note.noteId,
-        currentHash: note.blobId,
-        expectedHash,
-      },
-    );
-  }
 }
 
 export async function applyEdit(
@@ -1551,12 +1614,19 @@ export interface Services {
   search: SearchService;
   notes: NotesService;
   attributes: AttributesService;
+  hierarchy: HierarchyService;
+  attachments: AttachmentsService;
+  deletion: DeletionService;
 }
 
 export function createServices(deps: ServiceDeps): Services {
-  const shared: ServiceDeps = { ...deps, mutex: deps.mutex ?? new KeyedMutex() };
+  const mutex = deps.mutex ?? new KeyedMutex();
+  const shared: ServiceDeps = { ...deps, mutex };
   const search = new SearchService(shared);
   const notes = new NotesService(shared);
   const attributes = new AttributesService(shared, notes);
-  return { search, notes, attributes };
+  const hierarchy = new HierarchyService(deps.client, mutex);
+  const attachments = new AttachmentsService(deps.client, deps.limits, mutex);
+  const deletion = new DeletionService(deps.client);
+  return { search, notes, attributes, hierarchy, attachments, deletion };
 }

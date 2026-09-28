@@ -35,6 +35,19 @@ export function ok<T extends object>(structured: T): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(payload) }], structuredContent: payload };
 }
 
+/**
+ * Like `ok`, with extra content blocks after the JSON text block: an image
+ * block so multimodal clients can look at an image attachment, or an embedded
+ * resource for other binary data. `structuredContent` stays the source of truth.
+ */
+export function okWith<T extends object>(
+  structured: T,
+  extra: CallToolResult['content'],
+): CallToolResult {
+  const result = ok(structured);
+  return { ...result, content: [...result.content, ...extra] };
+}
+
 export function fail(err: unknown, context?: string): CallToolResult {
   const domain = DomainError.from(err, context);
   const payload: ToolErrorPayload = {

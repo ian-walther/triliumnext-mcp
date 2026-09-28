@@ -297,7 +297,7 @@ describe('R5 unknown content length is not reported as zero', () => {
     });
     const res = await services.notes.get({ noteId: 'uni', maxContentBytes: 1025 });
     expect(res.contentTruncated).toBe(true);
-    expect(res.contentBytes).toBeUndefined(); // in-memory Response carries no Content-Length
+    expect(res.contentBytes).toBe(6000); // the fake, like Trilium, sends Content-Length (3000 × 2 bytes)
     expect(res.content).toBe('é'.repeat(512));
     expect(trimUtf8(Buffer.from('aé', 'utf8').subarray(0, 2)).toString('utf8')).toBe('a');
   });

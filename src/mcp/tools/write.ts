@@ -3,15 +3,23 @@ import * as z from 'zod/v4';
 import type { Services } from '../../domain/services.js';
 import { ok, withAudit } from '../results.js';
 import {
+  attachmentSchema,
   attributeInputSchema,
   attributeOpResultSchema,
   attributeViewSchema,
+  base64Schema,
+  branchSchema,
   contentFormatSchema,
   noteDetailSchema,
   noteIdSchema,
   noteSummarySchema,
   noteTypeSchema,
 } from '../schemas.js';
+
+const attachmentIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_]{1,64}$/, 'attachmentId must be 1-64 characters of [A-Za-z0-9_]')
+  .describe('From list_attachments or get_attachment');
 import { defineTool, type AnyToolDefinition } from './types.js';
 
 const editSchema = z.object({
@@ -44,27 +52,28 @@ export function writeTools(services: Services): AnyToolDefinition[] {
       config: {
         title: 'Create note',
         description:
-          "Create a note under a parent. Text notes accept Markdown, HTML or plain text (auto-detected). Refuses to create a same-titled sibling unless ifTitleExists is 'create' or 'return_existing'. Optional attributes (labels, relations such as template=Board) are applied in the same call. Supply idempotencyKey when a retry must not create a second note.",
+          "Create a note under a parent. Text notes accept Markdown, HTML or plain text (auto-detected). File and image notes take contentBase64 plus mime instead of content. Refuses to create a same-titled sibling unless ifTitleExists is 'create' or 'return_existing'. Optional attributes (labels, relations such as template=Board) are applied in the same call. Supply idempotencyKey when a retry must not create a second note.",
         inputSchema: z.object({
           parentNoteId: noteIdSchema.optional().describe("Default 'root'"),
           title: z.string().min(1).max(1000),
           type: noteTypeSchema
             .optional()
             .describe(
-              "Default 'text'. Common: text, code (needs mime), book (folder), mermaid, search, render, webView, relationMap, noteMap.",
+              "Default 'text'. Common: text, code (needs mime), book (folder), mermaid, search, render, webView, relationMap, noteMap, file/image (need contentBase64 + mime).",
             ),
           mime: z
             .string()
             .max(200)
             .optional()
             .describe(
-              "Required for code notes, e.g. 'text/x-python', 'application/json', 'text/plain'",
+              "Required for code notes, e.g. 'text/x-python', 'application/json', 'text/plain', and for file/image notes, e.g. 'image/png', 'application/pdf'",
             ),
           content: z
             .string()
             .max(4_000_000)
             .optional()
             .describe('Initial content (optional). Markdown is converted to HTML for text notes.'),
+          contentBase64: base64Schema.max(6_000_000).optional(),
           contentFormat: contentFormatSchema,
           attributes: z.array(attributeInputSchema).max(50).optional(),
           ifTitleExists: z
@@ -125,7 +134,7 @@ export function writeTools(services: Services): AnyToolDefinition[] {
       config: {
         title: 'Patch note content',
         description:
-          "Write note content safely. Requires expectedHash from get_note; the write is refused (code CONFLICT) if the note changed in between. operation: 'replace' whole content, 'append' / 'prepend' with a separator, or 'edit' with find/replace edits applied in order (each must match exactly once unless occurrence or all is set). A revision is saved first unless createRevision=false. Returns the new contentHash.",
+          "Write note content safely. Requires expectedHash from get_note; the write is refused (code CONFLICT) if the note changed in between. operation: 'replace' whole content, 'append' / 'prepend' with a separator, or 'edit' with find/replace edits applied in order (each must match exactly once unless occurrence or all is set). File/image notes only support 'replace' with contentBase64. A revision is saved first unless createRevision=false. Returns the new contentHash.",
         inputSchema: z.object({
           noteId: noteIdSchema,
           expectedHash: z
@@ -139,6 +148,10 @@ export function writeTools(services: Services): AnyToolDefinition[] {
             .max(4_000_000)
             .optional()
             .describe('New content for replace/append/prepend'),
+          contentBase64: base64Schema
+            .max(6_000_000)
+            .optional()
+            .describe("Replacement body for file/image notes (operation 'replace')"),
           contentFormat: contentFormatSchema,
           edits: z.array(editSchema).max(100).optional().describe("For operation 'edit'"),
           separator: z
@@ -241,6 +254,130 @@ export function writeTools(services: Services): AnyToolDefinition[] {
             ? { code: failed === result.results.length ? 'ALL_FAILED' : 'PARTIAL' }
             : {}),
         });
+      },
+    }),
+    defineTool({
+      name: 'move_note',
+      scope: 'trilium.write',
+      config: {
+        title: 'Move or clone note',
+        description:
+          "Move a note to another parent, or clone it there (Trilium notes can live in several places). mode 'move' (default) relocates one placement: the new placement is created before the old one is removed, so the note is never without a parent. When the note already has several parents, say which one leaves with fromParentNoteId. Refuses cycles (a target inside the note's own subtree). Content, attributes and contentHash are unaffected.",
+        inputSchema: z.object({
+          noteId: noteIdSchema,
+          targetParentNoteId: noteIdSchema.describe('The new parent'),
+          fromParentNoteId: noteIdSchema
+            .optional()
+            .describe('Which existing placement moves, when the note has several parents'),
+          mode: z.enum(['move', 'clone']).optional().describe("Default 'move'"),
+          position: z
+            .union([z.enum(['first', 'last']), z.number().int().min(0)])
+            .optional()
+            .describe("'first', 'last' (default), or an explicit Trilium notePosition"),
+          prefix: z
+            .string()
+            .max(200)
+            .nullable()
+            .optional()
+            .describe(
+              'Branch prefix for the new placement; omitted keeps the old one, null clears',
+            ),
+        }),
+        outputSchema: z.object({
+          note: noteDetailSchema,
+          mode: z.enum(['move', 'clone']),
+          branch: branchSchema.describe('The placement under targetParentNoteId'),
+          removedBranch: branchSchema.optional(),
+          noop: z.boolean().describe('True when the note was already there and nothing changed'),
+          warnings: z.array(z.string()),
+        }),
+        annotations: {
+          title: 'Move or clone note',
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      noteIds: (args) => [args.noteId, args.targetParentNoteId],
+      handler: async (args) => {
+        const result = await services.hierarchy.move(args);
+        return withAudit(ok(result), {
+          noteIds: [
+            args.noteId,
+            args.targetParentNoteId,
+            ...(result.removedBranch ? [result.removedBranch.parentNoteId] : []),
+          ],
+          ...(result.noop ? { code: 'NOOP' } : {}),
+        });
+      },
+    }),
+    defineTool({
+      name: 'create_attachment',
+      scope: 'trilium.write',
+      config: {
+        title: 'Create attachment',
+        description:
+          "Attach a file to a note. Text goes in content, binary data in contentBase64 (base64 or a data: URI). role defaults to 'image' for image/* mime types (shown inline by Trilium) and 'file' otherwise. Returns the attachment with its contentHash.",
+        inputSchema: z.object({
+          noteId: noteIdSchema.describe('The note that will own the attachment'),
+          title: z.string().min(1).max(500).describe('File name as shown in Trilium'),
+          mime: z.string().max(200).describe("e.g. 'image/png', 'application/pdf', 'text/csv'"),
+          role: z.string().max(50).optional().describe("Trilium role: 'image' or 'file'"),
+          content: z.string().max(4_000_000).optional().describe('Text content'),
+          contentBase64: base64Schema.max(6_000_000).optional(),
+          position: z.number().int().min(0).optional(),
+        }),
+        outputSchema: z.object({ attachment: attachmentSchema, note: noteSummarySchema }),
+        annotations: {
+          title: 'Create attachment',
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      noteIds: (args) => [args.noteId],
+      handler: async (args) => ok(await services.attachments.create(args)),
+    }),
+    defineTool({
+      name: 'update_attachment',
+      scope: 'trilium.write',
+      config: {
+        title: 'Update attachment',
+        description:
+          "Rename an attachment, change its mime/role/position, or replace its content. Replacing content requires expectedHash (the attachment's contentHash) and is refused with CONFLICT if it changed in between.",
+        inputSchema: z.object({
+          attachmentId: attachmentIdSchema,
+          title: z.string().min(1).max(500).optional(),
+          mime: z.string().max(200).optional(),
+          role: z.string().max(50).optional(),
+          position: z.number().int().min(0).optional(),
+          content: z.string().max(4_000_000).optional().describe('New text content'),
+          contentBase64: base64Schema.max(6_000_000).optional().describe('New binary content'),
+          expectedHash: z
+            .string()
+            .max(100)
+            .optional()
+            .describe('Required when replacing content: contentHash from get_attachment'),
+        }),
+        outputSchema: z.object({
+          attachment: attachmentSchema,
+          changed: z.array(z.string()),
+          previousHash: z.string().optional(),
+        }),
+        annotations: {
+          title: 'Update attachment',
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      noteIds: () => [],
+      handler: async (args) => {
+        const result = await services.attachments.update(args);
+        return withAudit(ok(result), { noteIds: [result.attachment.ownerNoteId] });
       },
     }),
   ];

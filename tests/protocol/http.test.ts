@@ -44,10 +44,15 @@ describe('HTTP transport (auth none, loopback)', () => {
         'get_note_context',
         'list_children',
         'read_attributes',
+        'list_attachments',
+        'get_attachment',
         'create_note',
         'patch_note',
         'update_note_metadata',
         'manage_attributes',
+        'move_note',
+        'create_attachment',
+        'update_attachment',
       ]);
       const search = tools.tools.find((t) => t.name === 'search_notes')!;
       expect(search.annotations?.readOnlyHint).toBe(true);

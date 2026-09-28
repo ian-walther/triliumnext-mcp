@@ -10,9 +10,12 @@
 import { EtapiError } from './errors.js';
 import type {
   EtapiAppInfo,
+  EtapiAttachment,
+  EtapiAttachmentPatch,
   EtapiAttribute,
   EtapiAttributePatch,
   EtapiBranch,
+  EtapiCreateAttachmentDef,
   EtapiCreateAttributeDef,
   EtapiCreateBranchDef,
   EtapiCreateNoteDef,
@@ -58,9 +61,9 @@ interface RequestSpec {
   json?: unknown;
   body?: string | Uint8Array;
   contentType?: string;
-  accept?: 'json' | 'text' | 'bytes' | 'none';
+  accept?: 'json' | 'text' | 'bytes' | 'bytesBounded' | 'none';
   retry?: boolean;
-  /** For text reads: stop after this many bytes (the rest of the body is discarded). */
+  /** For bounded reads: stop after this many bytes (the rest of the body is discarded). */
   maxBytes?: number;
 }
 
@@ -161,6 +164,30 @@ export class TriliumClient {
     });
   }
 
+  /** Binary body for file/image notes; ETAPI accepts it only as application/octet-stream. */
+  async putNoteContentBytes(noteId: string, bytes: Uint8Array): Promise<void> {
+    assertEntityId(noteId);
+    await this.request<void>({
+      method: 'PUT',
+      path: `/notes/${noteId}/content`,
+      body: bytes,
+      contentType: 'application/octet-stream',
+      accept: 'none',
+    });
+  }
+
+  /** Bounded binary read: never buffers more than `maxBytes`; `truncated` says when it stopped early. */
+  async readNoteContentBytes(noteId: string, maxBytes: number): Promise<BoundedBytes> {
+    assertEntityId(noteId);
+    return await this.request<BoundedBytes>({
+      method: 'GET',
+      path: `/notes/${noteId}/content`,
+      accept: 'bytesBounded',
+      retry: true,
+      maxBytes,
+    });
+  }
+
   async createNote(def: EtapiCreateNoteDef): Promise<EtapiNoteWithBranch> {
     assertEntityId(def.parentNoteId, 'parentNoteId');
     return await this.request<EtapiNoteWithBranch>({
@@ -182,6 +209,15 @@ export class TriliumClient {
   async deleteNote(noteId: string): Promise<void> {
     assertEntityId(noteId);
     await this.request<void>({ method: 'DELETE', path: `/notes/${noteId}`, accept: 'none' });
+  }
+
+  /** Restore a soft-deleted note (Trilium keeps deleted notes until its erasure job runs). */
+  async undeleteNote(noteId: string): Promise<void> {
+    assertEntityId(noteId);
+    await this.request<{ success?: boolean }>({
+      method: 'POST',
+      path: `/notes/${noteId}/undelete`,
+    });
   }
 
   async createRevision(noteId: string, description?: string): Promise<void> {
@@ -258,6 +294,75 @@ export class TriliumClient {
     await this.request<void>({
       method: 'DELETE',
       path: `/attributes/${attributeId}`,
+      accept: 'none',
+    });
+  }
+
+  // ---- attachments -------------------------------------------------------
+
+  async listAttachments(noteId: string): Promise<EtapiAttachment[]> {
+    assertEntityId(noteId);
+    return await this.request<EtapiAttachment[]>({
+      method: 'GET',
+      path: `/notes/${noteId}/attachments`,
+      retry: true,
+    });
+  }
+
+  async getAttachment(attachmentId: string): Promise<EtapiAttachment> {
+    assertEntityId(attachmentId, 'attachmentId');
+    return await this.request<EtapiAttachment>({
+      method: 'GET',
+      path: `/attachments/${attachmentId}`,
+      retry: true,
+    });
+  }
+
+  async createAttachment(def: EtapiCreateAttachmentDef): Promise<EtapiAttachment> {
+    assertEntityId(def.ownerId, 'ownerId');
+    return await this.request<EtapiAttachment>({ method: 'POST', path: '/attachments', json: def });
+  }
+
+  async patchAttachment(
+    attachmentId: string,
+    patch: EtapiAttachmentPatch,
+  ): Promise<EtapiAttachment> {
+    assertEntityId(attachmentId, 'attachmentId');
+    return await this.request<EtapiAttachment>({
+      method: 'PATCH',
+      path: `/attachments/${attachmentId}`,
+      json: patch,
+    });
+  }
+
+  async deleteAttachment(attachmentId: string): Promise<void> {
+    assertEntityId(attachmentId, 'attachmentId');
+    await this.request<void>({
+      method: 'DELETE',
+      path: `/attachments/${attachmentId}`,
+      accept: 'none',
+    });
+  }
+
+  async readAttachmentContent(attachmentId: string, maxBytes: number): Promise<BoundedBytes> {
+    assertEntityId(attachmentId, 'attachmentId');
+    return await this.request<BoundedBytes>({
+      method: 'GET',
+      path: `/attachments/${attachmentId}/content`,
+      accept: 'bytesBounded',
+      retry: true,
+      maxBytes,
+    });
+  }
+
+  /** Text goes as text/plain, binary as application/octet-stream (the only types ETAPI accepts). */
+  async putAttachmentContent(attachmentId: string, content: string | Uint8Array): Promise<void> {
+    assertEntityId(attachmentId, 'attachmentId');
+    await this.request<void>({
+      method: 'PUT',
+      path: `/attachments/${attachmentId}/content`,
+      body: content,
+      contentType: typeof content === 'string' ? 'text/plain' : 'application/octet-stream',
       accept: 'none',
     });
   }
@@ -341,9 +446,12 @@ export class TriliumClient {
         }
         if (accept === 'text') {
           if (spec.maxBytes !== undefined) {
-            return (await readTextBounded(response, spec.maxBytes)) as T;
+            return toBoundedText(await readBounded(response, spec.maxBytes)) as T;
           }
           return (await response.text()) as T;
+        }
+        if (accept === 'bytesBounded') {
+          return (await readBounded(response, spec.maxBytes ?? Number.MAX_SAFE_INTEGER)) as T;
         }
         if (accept === 'bytes') return new Uint8Array(await response.arrayBuffer()) as T;
         const text = await response.text();
@@ -401,6 +509,15 @@ export interface BoundedText {
   totalBytes?: number;
 }
 
+export interface BoundedBytes {
+  bytes: Buffer;
+  truncated: boolean;
+  /** Total body size when known (Content-Length, or the bytes read when not truncated). */
+  totalBytes?: number;
+  /** Content-Type the server sent, when any. */
+  contentType?: string;
+}
+
 /** Trim a byte buffer to the last complete UTF-8 sequence. */
 export function trimUtf8(buf: Buffer): Buffer {
   const end = buf.length;
@@ -413,7 +530,20 @@ export function trimUtf8(buf: Buffer): Buffer {
   return end - i >= needed ? buf : buf.subarray(0, i);
 }
 
-async function readTextBounded(response: Response, maxBytes: number): Promise<BoundedText> {
+function toBoundedText(bounded: BoundedBytes): BoundedText {
+  return {
+    content: (bounded.truncated ? trimUtf8(bounded.bytes) : bounded.bytes).toString('utf8'),
+    truncated: bounded.truncated,
+    ...(bounded.totalBytes !== undefined ? { totalBytes: bounded.totalBytes } : {}),
+  };
+}
+
+/**
+ * Read at most `maxBytes` of a response body. Trilium sends whole bodies; this
+ * stops reading early and cancels the stream so a multi-megabyte note or
+ * attachment cannot exhaust memory on a small read.
+ */
+async function readBounded(response: Response, maxBytes: number): Promise<BoundedBytes> {
   // Content-Length is only meaningful when present, numeric, and describing the
   // decoded body (no content-encoding). Number(null) would be 0, so parse explicitly.
   const declaredRaw = response.headers.get('content-length');
@@ -422,16 +552,13 @@ async function readTextBounded(response: Response, maxBytes: number): Promise<Bo
     declaredRaw !== null && /^\d+$/.test(declaredRaw) && (!encoding || encoding === 'identity')
       ? Number(declaredRaw)
       : undefined;
+  const contentType = response.headers.get('content-type');
+  const withType = (b: BoundedBytes): BoundedBytes => (contentType ? { ...b, contentType } : b);
   if (!response.body) {
-    const text = await response.text();
-    const bytes = Buffer.from(text, 'utf8');
-    if (bytes.length <= maxBytes)
-      return { content: text, truncated: false, totalBytes: bytes.length };
-    return {
-      content: trimUtf8(bytes.subarray(0, maxBytes)).toString('utf8'),
-      truncated: true,
-      totalBytes: bytes.length,
-    };
+    const all = Buffer.from(await response.arrayBuffer());
+    if (all.length <= maxBytes)
+      return withType({ bytes: all, truncated: false, totalBytes: all.length });
+    return withType({ bytes: all.subarray(0, maxBytes), truncated: true, totalBytes: all.length });
   }
   const reader = response.body.getReader();
   const chunks: Buffer[] = [];
@@ -456,15 +583,15 @@ async function readTextBounded(response: Response, maxBytes: number): Promise<Bo
     reader.releaseLock();
   }
   const bytes: Buffer = Buffer.concat(chunks);
-  return {
-    content: (truncated ? trimUtf8(bytes) : bytes).toString('utf8'),
+  return withType({
+    bytes,
     truncated,
     ...(truncated
       ? totalFromHeader !== undefined
         ? { totalBytes: totalFromHeader }
         : {}
       : { totalBytes: bytes.length }),
-  };
+  });
 }
 
 function describeCause(cause: unknown): string {

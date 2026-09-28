@@ -28,9 +28,20 @@ This is a clean-room replacement for the `triliumnext-mcp` prototype. See
 | `patch_note`           | write | Hash-protected replace/append/prepend/edit with automatic revision                                                   |
 | `update_note_metadata` | write | Title, type, mime                                                                                                    |
 | `manage_attributes`    | write | Add/update/remove labels and relations with per-operation results                                                    |
+| `list_attachments`     | read  | Attachments of a note (id, title, mime, role, size, `contentHash`)                                                   |
+| `get_attachment`       | read  | Attachment content: text inline, binary as base64, images also as an image block                                     |
+| `move_note`            | write | Move or clone a note between parents; new placement is created before the old one is removed                         |
+| `create_attachment`    | write | Attach text or binary (base64 / data URI) content to a note                                                          |
+| `update_attachment`    | write | Rename / re-type an attachment or replace its content with hash protection                                           |
+| `delete_note`          | admin | Soft-delete a note (subtree only with `deleteDescendants`); needs `confirm` and the exact title; `dryRun` available  |
+| `undelete_note`        | admin | Restore a deleted note before Trilium erases it                                                                      |
+| `delete_attachment`    | admin | Delete one attachment (needs `confirm`)                                                                              |
 
-Deletion, moves, and binary attachments are intentionally absent from this
-release.
+File and image notes are created and replaced through `contentBase64` on
+`create_note` / `patch_note` and read back through `get_note`. Binary bodies
+are size-bounded (`MCP_MAX_WRITE_CONTENT_BYTES` on the way in,
+`maxContentBytes` on the way out) and never fetched from URLs or file paths.
+Bulk mutation stays out of scope.
 
 ## Quick start (local stdio)
 

@@ -42,7 +42,7 @@ describe.skipIf(!existsSync(DIST))('stdio transport (spawned dist/stdio.js)', ()
       expect(client.getProtocolEra()).toBe('legacy');
       expect(client.getServerVersion()?.name).toBe('trilium-mcp');
       const tools = await client.listTools();
-      expect(tools.tools).toHaveLength(10);
+      expect(tools.tools).toHaveLength(15);
       const res = await client.callTool({
         name: 'list_children',
         arguments: { noteId: 'projects' },

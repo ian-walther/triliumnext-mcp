@@ -53,9 +53,12 @@ everything with defaults.
 | `MCP_OIDC_AUTHORIZATION_SERVER`    | issuer                               | Advertised in protected-resource metadata.                                                                                                                                                                                                                                                                             |
 | `MCP_OIDC_CLOCK_TOLERANCE_SECONDS` | `60`                                 | Leeway for `exp`/`nbf`.                                                                                                                                                                                                                                                                                                |
 
-Scopes: `trilium.read` (search, resolve, get, context, list, read attributes),
-`trilium.write` (create, patch, metadata, manage attributes), `trilium.admin`
-(reserved for future destructive tools; grants nothing today).
+Scopes: `trilium.read` (search, resolve, get, context, list, read attributes,
+list/get attachments), `trilium.write` (create, patch, metadata, manage
+attributes, move/clone, create/update attachments), `trilium.admin`
+(destructive: delete/undelete notes, delete attachments). Admin tools are only
+listed to principals that hold `trilium.admin`; grant it to a client or user
+deliberately, never by default.
 
 ## Limits
 

@@ -142,3 +142,36 @@ export interface EtapiErrorBody {
   code: string;
   message: string;
 }
+
+export interface EtapiAttachment {
+  attachmentId: string;
+  /** noteId (or revisionId) that owns the attachment. */
+  ownerId: string;
+  role: string;
+  mime: string;
+  title: string;
+  position: number;
+  /** Content hash, like a note's blobId. */
+  blobId: string;
+  dateModified?: string;
+  utcDateModified?: string;
+  utcDateScheduledForErasureSince?: string | null;
+  contentLength?: number;
+}
+
+export interface EtapiCreateAttachmentDef {
+  ownerId: string;
+  role: string;
+  mime: string;
+  title: string;
+  /** Text content stored as-is; binary content is uploaded afterwards. */
+  content?: string;
+  position?: number;
+}
+
+export interface EtapiAttachmentPatch {
+  role?: string;
+  mime?: string;
+  title?: string;
+  position?: number;
+}

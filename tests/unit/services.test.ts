@@ -138,19 +138,31 @@ describe('NotesService.get / context / listChildren', () => {
     const small = await services.notes.get({ noteId: 'plumb', maxContentBytes: 1024 });
     expect(small.contentTruncated).toBe(false);
   });
-  it('omits content for protected and binary notes', async () => {
+  it('omits content for protected notes and returns binary notes as base64', async () => {
     fake.addNote({ noteId: 'secret', title: 'Secret', parentNoteId: 'root', isProtected: true });
-    fake.addNote({
+    const img = fake.addNote({
       noteId: 'img',
       title: 'Img',
       type: 'image',
       mime: 'image/png',
       parentNoteId: 'root',
     });
+    img.binary = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
     expect((await services.notes.get({ noteId: 'secret' })).contentOmittedReason).toMatch(
       /protected/,
     );
-    expect((await services.notes.get({ noteId: 'img' })).contentOmittedReason).toMatch(/Binary/);
+    const read = await services.notes.get({ noteId: 'img' });
+    expect(read.content).toBeUndefined();
+    expect(read.contentBase64).toBe(Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'));
+    expect(read.contentBytes).toBe(4);
+    // A binary body larger than the window is omitted with its size instead of cut.
+    const small = await services.notes.get({ noteId: 'img', maxContentBytes: 1024 });
+    expect(small.contentBase64).toBeDefined();
+    img.binary = Buffer.alloc(2048, 1);
+    const big = await services.notes.get({ noteId: 'img', maxContentBytes: 1024 });
+    expect(big.contentBase64).toBeUndefined();
+    expect(big.contentOmittedReason).toMatch(/exceeds maxContentBytes/);
+    expect(big.contentBytes).toBe(2048);
   });
   it('maps 404 to NOT_FOUND', async () => {
     await expect(services.notes.get({ noteId: 'missing' })).rejects.toMatchObject({
@@ -248,9 +260,13 @@ describe('NotesService.create', () => {
     await expect(
       services.notes.create({ principal: 'p', title: 'x', type: 'code' }),
     ).rejects.toMatchObject({ code: 'VALIDATION' });
+    // Binary note types need contentBase64 (and text types must not send it).
     await expect(
       services.notes.create({ principal: 'p', title: 'x', type: 'image' }),
-    ).rejects.toMatchObject({ code: 'UNSUPPORTED' });
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(
+      services.notes.create({ principal: 'p', title: 'x', type: 'text', contentBase64: 'AAAA' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
     await expect(
       services.notes.create({
         principal: 'p',
