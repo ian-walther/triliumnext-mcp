@@ -5,6 +5,7 @@ import { expandReplacement, expandReplacementInto } from '../../src/domain/regex
 import {
   applyEdit,
   createServices,
+  MAX_REPLACEMENT_WORK,
   type CreateNoteResult,
   type Services,
 } from '../../src/domain/services.js';
@@ -545,5 +546,112 @@ describe('R7 / R4 (pass 4) replacement templates parse linearly and match native
     });
     expect(performance.now() - t0).toBeLessThan(2000);
     expect(fake.notes.get('r7')?.content).toBe('abc'.replace(/(?<x>b)/, big));
+  });
+});
+
+describe('R8 (pass 5) aggregate replacement work is budgeted', () => {
+  /** Measures the longest event-loop stall while `fn` runs. */
+  async function withLoopWatch<T>(fn: () => Promise<T>): Promise<{ result: T; maxGapMs: number }> {
+    let last = performance.now();
+    let maxGapMs = 0;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      maxGapMs = Math.max(maxGapMs, now - last - 5);
+      last = now;
+    }, 5);
+    try {
+      return { result: await fn(), maxGapMs };
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
+  it("rejects the audit's reproduction before any revision or write, without stalling the loop", async () => {
+    fake.addNote({
+      noteId: 'r8',
+      title: 'R8',
+      type: 'code',
+      mime: 'text/plain',
+      parentNoteId: 'home',
+      content: 'a'.repeat(2000),
+    });
+    const before = fake.calls.length;
+    const { result, maxGapMs } = await withLoopWatch(() =>
+      services.notes
+        .patch({
+          noteId: 'r8',
+          expectedHash: fake.blobId('r8'),
+          operation: 'edit',
+          edits: [{ find: '(z)?a', replace: '$1'.repeat(100_000), regex: true, all: true }],
+        })
+        .catch((e: unknown) => e),
+    );
+    expect(result).toMatchObject({
+      code: 'TOO_LARGE',
+      details: { cost: 200_000_000, limit: MAX_REPLACEMENT_WORK },
+    });
+    expect(maxGapMs).toBeLessThan(300);
+    expect(
+      fake.calls.slice(before).some((c) => c.method === 'PUT' || /\/revision$/.test(c.path)),
+    ).toBe(false);
+    expect(fake.notes.get('r8')?.content).toBe('a'.repeat(2000));
+  });
+
+  it('rejects the 10 000-match variant immediately and charges work across edits of one call', async () => {
+    const started = performance.now();
+    await expect(
+      applyEdit(
+        'a'.repeat(10_000),
+        { find: '(z)?a', replace: '$1'.repeat(100_000), regex: true, all: true },
+        'e',
+        500,
+      ),
+    ).rejects.toMatchObject({ code: 'TOO_LARGE' });
+    expect(performance.now() - started).toBeLessThan(1500);
+    // Two edits each within the budget alone, but not together: the second is refused before expansion.
+    fake.addNote({
+      noteId: 'r8b',
+      title: 'R8b',
+      type: 'code',
+      mime: 'text/plain',
+      parentNoteId: 'home',
+      content: 'a'.repeat(3000),
+    });
+    const halfPlus = '$1'.repeat(999) + '$&'; // 1000 tokens × 3000 matches = 3M per edit; keeps each 'a' so edit 2 still matches
+    await expect(
+      services.notes.patch({
+        noteId: 'r8b',
+        expectedHash: fake.blobId('r8b'),
+        operation: 'edit',
+        edits: [
+          { find: '(z)?a', replace: halfPlus, regex: true, all: true },
+          { find: '(z)?a', replace: halfPlus, regex: true, all: true },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: 'TOO_LARGE',
+      details: { cost: 3_000_000, remaining: 2_000_000 },
+    });
+    expect(fake.notes.get('r8b')?.content).toBe('a'.repeat(3000));
+  });
+
+  it('the budget is explicit and ordinary large edits still complete', async () => {
+    const work = { remaining: MAX_REPLACEMENT_WORK };
+    const out = await applyEdit(
+      'a'.repeat(10_000),
+      { find: '(z)?a', replace: '$1b', regex: true, all: true },
+      'e',
+      500,
+      Number.POSITIVE_INFINITY,
+      work,
+    );
+    expect(out).toBe('b'.repeat(10_000));
+    expect(work.remaining).toBe(MAX_REPLACEMENT_WORK - 2 * 10_000); // 2 tokens × 10 000 matches
+    await expect(
+      applyEdit('abab', { find: 'b', replace: '$$$&', regex: true, occurrence: 2 }, 'e', 500),
+    ).resolves.toBe('aba$b');
+    await expect(
+      applyEdit('abab', { find: 'b', replace: '$1', regex: false, all: true }, 'e', 500),
+    ).resolves.toBe('a$1a$1');
   });
 });

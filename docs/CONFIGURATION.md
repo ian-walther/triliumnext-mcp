@@ -66,7 +66,7 @@ Scopes: `trilium.read` (search, resolve, get, context, list, read attributes),
 | `MCP_MAX_SEARCH_LIMIT`           | `200`     | Page size cap.                                       |
 | `MCP_MAX_CHILDREN`               | `500`     | Children cap for `list_children`/`get_note_context`. |
 
-Fixed bounds: cursors address at most offset 10 000; ascending `orderBy` covers the first 1 000 matches (`truncated: true` beyond); `find` searches the returned content window and matches are cut to 500 characters with 80 characters of context each side; caller regexes run in a worker thread with a 2 s budget and are terminated on overrun; `patch_note` edits are assembled under the write byte budget and fail with `TOO_LARGE` before any scan, revision or write once they exceed it.
+Fixed bounds: cursors address at most offset 10 000; ascending `orderBy` covers the first 1 000 matches (`truncated: true` beyond); `find` searches the returned content window and matches are cut to 500 characters with 80 characters of context each side; caller regexes run in a worker thread with a 2 s budget and are terminated on overrun; `patch_note` edits are assembled under the write byte budget and fail with `TOO_LARGE` before any scan, revision or write once they exceed it; each call also has a replacement work budget of 5 000 000 token evaluations (template tokens × matches, summed over its edits), charged before expansion, so CPU time is bounded even when substitutions produce no bytes.
 
 ## Logging and audit
 

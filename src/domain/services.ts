@@ -25,7 +25,8 @@ import { KeyedMutex } from './keyedMutex.js';
 import {
   compilePattern,
   escapeRegex,
-  expandReplacementInto,
+  expandTokensInto,
+  parseReplacementTemplate,
   scanRegex,
   type RegexMatch,
 } from './regexRunner.js';
@@ -61,6 +62,16 @@ export interface ServiceDeps {
 
 /** Deepest page offset a cursor may address; bounds how much upstream work one call can demand. */
 export const MAX_CURSOR_OFFSET = 10_000;
+/**
+ * Replacement work budget for one patch_note call: the sum over its edits of
+ * (template tokens × selected matches). Expansion runs on the main thread, so
+ * this bounds CPU time independently of output size (zero-byte substitutions
+ * count too). 5M token evaluations is tens of milliseconds.
+ */
+export const MAX_REPLACEMENT_WORK = 5_000_000;
+export interface WorkBudget {
+  remaining: number;
+}
 /** Longest matched text returned by a find; longer matches are cut and flagged. */
 export const MAX_MATCH_CHARS = 500;
 const CONTEXT_CHARS = 80;
@@ -989,6 +1000,7 @@ export class NotesService {
         if (!input.edits?.length)
           throw DomainError.validation("operation 'edit' requires a non-empty edits array");
         next = existing;
+        const work: WorkBudget = { remaining: MAX_REPLACEMENT_WORK };
         for (const [i, edit] of input.edits.entries()) {
           next = await applyEdit(
             next,
@@ -996,6 +1008,7 @@ export class NotesService {
             `edits[${i}]`,
             this.deps.regexTimeoutMs,
             limits.maxWriteContentBytes,
+            work,
           );
           editsApplied += 1;
         }
@@ -1250,6 +1263,7 @@ export async function applyEdit(
   where: string,
   timeoutMs?: number,
   maxBytes: number = Number.POSITIVE_INFINITY,
+  work: WorkBudget = { remaining: MAX_REPLACEMENT_WORK },
 ): Promise<string> {
   if (edit.find === '') throw DomainError.validation(`${where}: find must not be empty`);
   const literal = !edit.regex;
@@ -1301,11 +1315,30 @@ export async function applyEdit(
       );
     chosen = [target];
   }
+  // Parse the template once; charge tokens × matches against the call's work
+  // budget before expanding anything (AUDIT R8). Zero-byte substitutions cost
+  // CPU without adding output, so the byte budget alone cannot bound this.
+  const tokens = literal
+    ? [{ kind: 'literal' as const, text: edit.replace }]
+    : parseReplacementTemplate(
+        edit.replace,
+        matches[0]!.captures.length - 1,
+        matches[0]!.groups !== undefined && matches[0]!.groups !== null,
+      );
+  const cost = tokens.length * chosen.length;
+  if (cost > work.remaining) {
+    throw new DomainError(
+      'TOO_LARGE',
+      `${where}: this edit needs ${cost} replacement operations (${tokens.length} template tokens × ${chosen.length} matches); the remaining budget for this call is ${work.remaining} of ${MAX_REPLACEMENT_WORK}. Use a shorter template, fewer matches, or several calls.`,
+      { cost, remaining: work.remaining, limit: MAX_REPLACEMENT_WORK },
+    );
+  }
+  work.remaining -= cost;
   let last = 0;
   for (const m of chosen) {
     out.push(content.slice(last, m.index));
-    // Expand token by token so the budget applies before any large piece is materialized.
-    expandReplacementInto(edit.replace, m, content, literal, (piece) => out.push(piece));
+    // Expand token by token so the byte budget applies before any large piece is materialized.
+    expandTokensInto(tokens, m, content, (piece) => out.push(piece));
     last = m.index + m.length;
   }
   out.push(content.slice(last));

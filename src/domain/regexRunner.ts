@@ -141,35 +141,30 @@ export function scanRegex(options: ScanOptions): Promise<ScanResult> {
   });
 }
 
+export type ReplacementToken =
+  | { kind: 'literal'; text: string }
+  | { kind: 'match' }
+  | { kind: 'prefix' }
+  | { kind: 'suffix' }
+  | { kind: 'capture'; index: number }
+  | { kind: 'named'; name: string };
+
 /**
- * Expand a String.prototype.replace-style template against one match of
- * `content`, emitting each literal run and token value through `emit` as it is
- * produced. Nothing is joined here, so an `emit` that enforces a byte budget
- * bounds the expansion before any large string exists (AUDIT R3).
+ * Parse a String.prototype.replace-style template once, for a pattern with
+ * `captureCount` numbered groups and (when `hasNamedGroups`) a named-group map.
  *
- * This is a hand-written, single-pass implementation of ECMAScript
- * GetSubstitution: `$$`, `$&`, `$\``, `$'`, `$n`/`$nn` (with the two-digit
- * fallback), and `$<name>`. Differences from the native algorithm are only
- * these two deliberate ones:
- * - named captures are substituted only for own properties of the group map,
- *   because the map crossed a worker boundary and no longer has a null
- *   prototype (AUDIT R4);
- * - work is linear in the template length even for many unterminated `$<`
- *   sequences, because the next `>` is located once and reused (AUDIT R7).
+ * A hand-written, single-pass implementation of ECMAScript GetSubstitution:
+ * `$$`, `$&`, `$\``, `$'`, `$n`/`$nn` (with the two-digit fallback), and
+ * `$<name>`. Work is linear in the template length even for many unterminated
+ * `$<` sequences, because the next `>` is located once and reused (AUDIT R7).
+ * The token list is reused for every match of the same edit (AUDIT R8).
  */
-export function expandReplacementInto(
+export function parseReplacementTemplate(
   template: string,
-  match: RegexMatch,
-  content: string,
-  literal: boolean,
-  emit: (piece: string) => void,
-): void {
-  if (literal) {
-    emit(template);
-    return;
-  }
-  const captureCount = match.captures.length - 1;
-  const groups = match.groups ?? undefined;
+  captureCount: number,
+  hasNamedGroups: boolean,
+): ReplacementToken[] {
+  const tokens: ReplacementToken[] = [];
   const len = template.length;
   let pos = 0;
   let runStart = 0;
@@ -177,22 +172,22 @@ export function expandReplacementInto(
   let gtFrom = 0;
   let nextGt = template.indexOf('>');
   const flush = (end: number) => {
-    if (end > runStart) emit(template.slice(runStart, end));
+    if (end > runStart) tokens.push({ kind: 'literal', text: template.slice(runStart, end) });
   };
   while (pos < len) {
     const dollar = template.indexOf('$', pos);
     if (dollar === -1 || dollar === len - 1) break;
     const next = template.charCodeAt(dollar + 1);
     let consumed = 2;
-    let value: string | undefined;
+    let token: ReplacementToken;
     if (next === 0x24)
-      value = '$'; // $$
+      token = { kind: 'literal', text: '$' }; // $$
     else if (next === 0x26)
-      value = match.captures[0] ?? ''; // $&
+      token = { kind: 'match' }; // $&
     else if (next === 0x60)
-      value = content.slice(0, match.index); // $`
+      token = { kind: 'prefix' }; // $`
     else if (next === 0x27)
-      value = content.slice(match.index + match.length); // $'
+      token = { kind: 'suffix' }; // $'
     else if (next >= 0x30 && next <= 0x39) {
       // $n or $nn: prefer two digits when that group exists, else one digit.
       const d1 = next - 0x30;
@@ -205,13 +200,15 @@ export function expandReplacementInto(
         digits = 1;
       }
       consumed = 1 + digits;
-      if (index >= 1 && index <= captureCount) value = match.captures[index] ?? '';
-      else value = template.slice(dollar, dollar + consumed); // literal "$0", "$9", ...
+      token =
+        index >= 1 && index <= captureCount
+          ? { kind: 'capture', index }
+          : { kind: 'literal', text: template.slice(dollar, dollar + consumed) }; // "$0", "$9", ...
     } else if (next === 0x3c) {
       // $<
-      if (groups === undefined) {
+      if (!hasNamedGroups) {
         // No named groups: "$<" is literal and parsing continues right after it.
-        value = '$<';
+        token = { kind: 'literal', text: '$<' };
       } else {
         if (nextGt !== -1 && nextGt < dollar + 2) {
           if (gtFrom <= nextGt) {
@@ -219,24 +216,86 @@ export function expandReplacementInto(
             gtFrom = dollar + 2;
           }
         }
-        if (nextGt === -1) value = '$<';
+        if (nextGt === -1) token = { kind: 'literal', text: '$<' };
         else {
-          const name = template.slice(dollar + 2, nextGt);
-          value = Object.hasOwn(groups, name) ? (groups[name] ?? '') : '';
+          token = { kind: 'named', name: template.slice(dollar + 2, nextGt) };
           consumed = nextGt + 1 - dollar;
         }
       }
     } else {
       // "$" followed by anything else is a literal "$"; keep parsing at the next char.
-      value = '$';
+      token = { kind: 'literal', text: '$' };
       consumed = 1;
     }
     flush(dollar);
-    emit(value);
+    tokens.push(token);
     pos = dollar + consumed;
     runStart = pos;
   }
   flush(len);
+  return tokens;
+}
+
+/**
+ * Emit the expansion of parsed tokens for one match, piece by piece, so an
+ * `emit` that enforces a byte budget bounds the output before any large string
+ * exists (AUDIT R3). Named captures are substituted only for own properties of
+ * the group map, because the map crossed a worker boundary and no longer has a
+ * null prototype (AUDIT R4).
+ */
+export function expandTokensInto(
+  tokens: readonly ReplacementToken[],
+  match: RegexMatch,
+  content: string,
+  emit: (piece: string) => void,
+): void {
+  const groups = match.groups ?? undefined;
+  for (const token of tokens) {
+    switch (token.kind) {
+      case 'literal':
+        emit(token.text);
+        break;
+      case 'match':
+        emit(match.captures[0] ?? '');
+        break;
+      case 'prefix':
+        emit(content.slice(0, match.index));
+        break;
+      case 'suffix':
+        emit(content.slice(match.index + match.length));
+        break;
+      case 'capture':
+        emit(match.captures[token.index] ?? '');
+        break;
+      case 'named':
+        emit(
+          groups !== undefined && Object.hasOwn(groups, token.name)
+            ? (groups[token.name] ?? '')
+            : '',
+        );
+        break;
+    }
+  }
+}
+
+/** Parse and expand for one match (tests and one-off callers). */
+export function expandReplacementInto(
+  template: string,
+  match: RegexMatch,
+  content: string,
+  literal: boolean,
+  emit: (piece: string) => void,
+): void {
+  if (literal) {
+    emit(template);
+    return;
+  }
+  const tokens = parseReplacementTemplate(
+    template,
+    match.captures.length - 1,
+    match.groups !== undefined && match.groups !== null,
+  );
+  expandTokensInto(tokens, match, content, emit);
 }
 
 /** Convenience wrapper without a budget; the edit path uses expandReplacementInto. */
